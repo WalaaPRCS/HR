@@ -43,8 +43,33 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() in ("1", "true", "yes")
 LOGIN_FAILURES: dict[str, list[float]] = {}
 
-if not ADMIN_USERNAME or not ADMIN_PASSWORD or len(SESSION_SECRET) < 32:
-    raise RuntimeError("Set HR_ADMIN_USERNAME, HR_ADMIN_PASSWORD, and a 32+ character SESSION_SECRET.")
+if len(SESSION_SECRET) < 32:
+    raise RuntimeError("Set a 32+ character SESSION_SECRET.")
+
+def admin_setup_complete() -> bool:
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM public.admin_account WHERE id = 1").fetchone()
+    return row is not None
+
+def get_admin_account():
+    with connect() as conn:
+        return conn.execute(
+            "SELECT username, password_hash FROM public.admin_account WHERE id = 1"
+        ).fetchone()
+
+def password_hash(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+    return base64.b64encode(salt + digest).decode("ascii")
+
+def verify_password(password: str, encoded_hash: str) -> bool:
+    try:
+        raw = base64.b64decode(encoded_hash, validate=True)
+        salt, expected = raw[:16], raw[16:]
+        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
 
 
 def connect():
@@ -91,7 +116,10 @@ def authenticated_username(request: Request) -> str | None:
             return None
         decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
         claims = json.loads(decoded)
-        if int(claims["exp"]) <= int(time.time()) or claims["sub"] != ADMIN_USERNAME:
+        if int(claims["exp"]) <= int(time.time()):
+            return None
+        account = get_admin_account()
+        if not account or not hmac.compare_digest(str(claims["sub"]), account["username"]):
             return None
         return str(claims["sub"])
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
@@ -112,9 +140,9 @@ def check_same_origin(request: Request) -> None:
 @app.middleware("http")
 async def protect_application(request: Request, call_next):
     path = request.url.path
-    open_paths = {"/login.html", "/api/login", "/api/session", "/api/healthz"}
+    open_paths = {"/login.html", "/api/login", "/api/session", "/api/setup-status", "/api/setup-admin", "/api/healthz"}
     if path not in open_paths:
-        if path.startswith("/api/") and authenticated_username(request) is None:
+        if path.startswith("/api/") and path not in {"/api/setup-status", "/api/setup-admin"} and authenticated_username(request) is None:
             return JSONResponse(status_code=401, content={"detail": "يلزم تسجيل الدخول."})
         if not path.startswith("/api/") and authenticated_username(request) is None:
             return RedirectResponse("/login.html", status_code=303)
@@ -134,6 +162,51 @@ def healthz():
         return {"status": "ok"}
     except Exception:
         return JSONResponse(status_code=503, content={"status": "database_unavailable"})
+
+
+@app.get("/api/setup-status")
+def setup_status():
+    return {"setup_required": not admin_setup_complete()}
+
+
+@app.post("/api/setup-admin")
+async def setup_admin(request: Request):
+    check_same_origin(request)
+    if admin_setup_complete():
+        raise HTTPException(status_code=409, detail="تم إنشاء حساب المدير مسبقاً.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="بيانات إنشاء الحساب غير صالحة.")
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    confirmation = str(body.get("confirm_password", ""))
+    if len(username) < 3 or len(username) > 80:
+        raise HTTPException(status_code=422, detail="اسم المستخدم يجب أن يكون بين 3 و80 حرفاً.")
+    if len(password) < 12 or len(password) > 256:
+        raise HTTPException(status_code=422, detail="كلمة المرور يجب أن تكون 12 حرفاً على الأقل.")
+    if password != confirmation:
+        raise HTTPException(status_code=422, detail="تأكيد كلمة المرور غير مطابق.")
+    hashed = password_hash(password)
+    try:
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO public.admin_account (id, username, password_hash) VALUES (1, %s, %s)",
+                (username, hashed),
+            )
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="تم إنشاء حساب المدير مسبقاً.")
+    response = JSONResponse({"authenticated": True, "username": username})
+    response.set_cookie(
+        COOKIE_NAME,
+        session_token(username, int(time.time()) + SESSION_HOURS * 3600),
+        max_age=SESSION_HOURS * 3600,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return response
 
 
 @app.get("/api/session")
@@ -157,17 +230,18 @@ async def login(request: Request):
     LOGIN_FAILURES[bucket] = attempts
     if len(attempts) >= 8:
         raise HTTPException(status_code=429, detail="محاولات كثيرة. حاول بعد 15 دقيقة.")
-    valid_user = hmac.compare_digest(username.encode(), ADMIN_USERNAME.encode())
-    valid_password = hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
+    account = get_admin_account()
+    valid_user = bool(account and hmac.compare_digest(username.encode(), account["username"].encode()))
+    valid_password = bool(account and verify_password(password, account["password_hash"]))
     if not (valid_user and valid_password):
         attempts.append(time.time())
         LOGIN_FAILURES[bucket] = attempts
         raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة.")
     LOGIN_FAILURES.pop(bucket, None)
-    response = JSONResponse({"authenticated": True, "username": ADMIN_USERNAME})
+    response = JSONResponse({"authenticated": True, "username": account["username"]})
     response.set_cookie(
         COOKIE_NAME,
-        session_token(ADMIN_USERNAME, int(time.time()) + SESSION_HOURS * 3600),
+        session_token(account["username"], int(time.time()) + SESSION_HOURS * 3600),
         max_age=SESSION_HOURS * 3600,
         httponly=True,
         secure=COOKIE_SECURE,
