@@ -37,8 +37,6 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
     "connect_timeout": 5,
 }
-ADMIN_USERNAME = os.getenv("HR_ADMIN_USERNAME", "")
-ADMIN_PASSWORD = os.getenv("HR_ADMIN_PASSWORD", "")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() in ("1", "true", "yes")
 LOGIN_FAILURES: dict[str, list[float]] = {}
@@ -554,7 +552,7 @@ async def import_employees(request: Request, file: UploadFile = File(...)):
                 """INSERT INTO public.employee_import_control
                    (id, source_filename, sha256, imported_rows, imported_by)
                    VALUES (1, %s, %s, %s, %s)""",
-                (filename, file_hash, len(rows), ADMIN_USERNAME),
+                (filename, file_hash, len(rows), authenticated_username(request) or "admin"),
             )
     except HTTPException:
         raise
