@@ -692,4 +692,40 @@ def root_page(request: Request):
     return RedirectResponse("/index.html", status_code=307)
 
 
+
+@app.get("/api/settings/reference-data")
+def reference_data():
+    with connect() as conn:
+        data = {
+            "work_centers": conn.execute("SELECT id, name FROM public.ref_work_centers ORDER BY name").fetchall(),
+            "directorates": conn.execute("SELECT id, name FROM public.ref_directorates ORDER BY name").fetchall(),
+            "departments": conn.execute("SELECT id, name FROM public.ref_departments ORDER BY name").fetchall(),
+            "job_titles": conn.execute("SELECT id, name FROM public.ref_job_titles ORDER BY name").fetchall(),
+            "employment_statuses": conn.execute("SELECT id, name FROM public.ref_employment_statuses ORDER BY name").fetchall(),
+            "cadre_types": conn.execute("SELECT id, name FROM public.ref_cadre_types ORDER BY name").fetchall(),
+            "center_directorates": conn.execute(
+                """SELECT c.name AS work_center, d.name AS directorate
+                   FROM public.ref_center_directorates x
+                   JOIN public.ref_work_centers c ON c.id=x.center_id
+                   JOIN public.ref_directorates d ON d.id=x.directorate_id
+                   ORDER BY c.name,d.name"""
+            ).fetchall(),
+            "directorate_departments": conn.execute(
+                """SELECT d.name AS directorate, p.name AS department
+                   FROM public.ref_directorate_departments x
+                   JOIN public.ref_directorates d ON d.id=x.directorate_id
+                   JOIN public.ref_departments p ON p.id=x.department_id
+                   ORDER BY d.name,p.name"""
+            ).fetchall(),
+            "department_job_titles": conn.execute(
+                """SELECT p.name AS department, j.name AS job_title
+                   FROM public.ref_department_job_titles x
+                   JOIN public.ref_departments p ON p.id=x.department_id
+                   JOIN public.ref_job_titles j ON j.id=x.job_title_id
+                   ORDER BY p.name,j.name"""
+            ).fetchall(),
+        }
+    return data
+
+
 app.mount("/", StaticFiles(directory=PUBLIC_DIR, html=True), name="public")
