@@ -1,0 +1,34 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-prcs_hr}"
+      POSTGRES_USER: "${POSTGRES_USER:-prcs_hr_app}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify before deployment}"
+    volumes:
+      - hr_postgres_data:/var/lib/postgresql/data
+      - ./database/migrations/001_create_employees.sql:/docker-entrypoint-initdb.d/001_create_employees.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$${POSTGRES_USER} -d $$${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  hr_postgres_data:
