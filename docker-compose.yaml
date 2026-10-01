@@ -12,8 +12,6 @@ services:
       DB_NAME: ${POSTGRES_DB:-prcs_hr}
       DB_USER: ${POSTGRES_USER:-prcs_hr_app}
       DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify before deployment}
-      HR_ADMIN_USERNAME: ${HR_ADMIN_USERNAME:?Set HR_ADMIN_USERNAME in Coolify before deployment}
-      HR_ADMIN_PASSWORD: ${HR_ADMIN_PASSWORD:?Set HR_ADMIN_PASSWORD in Coolify before deployment}
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in Coolify before deployment}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
     depends_on:
