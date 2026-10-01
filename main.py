@@ -705,7 +705,6 @@ REF_TABLES = {
 REF_PARENTS = {
     "directorates": ("ref_center_directorates", "center_id", "directorate_id", "ref_work_centers", "work_center", "directorate"),
     "departments": ("ref_directorate_departments", "directorate_id", "department_id", "ref_directorates", "directorate", "department"),
-    "job_titles": ("ref_department_job_titles", "department_id", "job_title_id", "ref_departments", "department", "job_title"),
 }
 REF_LINKS = {
     "center_directorates": ("ref_center_directorates", "center_id", "directorate_id", "ref_work_centers", "ref_directorates", "work_center", "directorate"),
@@ -744,19 +743,52 @@ def reference_data():
                JOIN public.ref_departments p ON p.id=x.department_id
                ORDER BY d.name,p.name"""
         ).fetchall()
+        data["directorate_department_paths"] = conn.execute(
+            """SELECT x.directorate_id,x.department_id,
+                      x.directorate_id::text || ':' || x.department_id::text AS path_id,
+                      d.name AS directorate_name,p.name AS department_name
+               FROM public.ref_directorate_departments x
+               JOIN public.ref_directorates d ON d.id=x.directorate_id
+               JOIN public.ref_departments p ON p.id=x.department_id
+               ORDER BY d.name,p.name"""
+        ).fetchall()
         data["department_job_titles"] = conn.execute(
-            """SELECT x.department_id AS left_id,x.job_title_id AS right_id,
-                      p.name AS left_name,j.name AS right_name
-               FROM public.ref_department_job_titles x
+            """SELECT x.directorate_id,x.department_id,
+                      x.directorate_id::text || ':' || x.department_id::text AS path_id,
+                      x.job_title_id AS right_id,
+                      d.name || ' — ' || p.name AS left_name,j.name AS right_name
+               FROM public.ref_directorate_department_job_titles x
+               JOIN public.ref_directorates d ON d.id=x.directorate_id
                JOIN public.ref_departments p ON p.id=x.department_id
                JOIN public.ref_job_titles j ON j.id=x.job_title_id
-               ORDER BY p.name,j.name"""
+               ORDER BY d.name,p.name,j.name"""
         ).fetchall()
     return data
 
 
 
-def validate_parent_ids(category: str, parent_ids: Any, conn) -> list[int]:
+def validate_parent_ids(category: str, parent_ids: Any, conn):
+    if category == "job_titles":
+        if not isinstance(parent_ids, list):
+            raise HTTPException(status_code=422, detail="حدد الأقسام المرتبطة بالمسمى.")
+        try:
+            paths = []
+            for value in parent_ids:
+                parts = str(value).split(":")
+                if len(parts) != 2: raise ValueError
+                paths.append((int(parts[0]), int(parts[1])))
+            paths = sorted(set(paths))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="قائمة ارتباطات الإدارة والقسم غير صالحة.")
+        if not paths:
+            raise HTTPException(status_code=422, detail="حدد قسمًا مرتبطًا واحدًا على الأقل.")
+        found = conn.execute(
+            "SELECT directorate_id,department_id FROM public.ref_directorate_departments WHERE (directorate_id,department_id) IN (SELECT * FROM unnest(%s::bigint[],%s::bigint[]))",
+            ([x[0] for x in paths],[x[1] for x in paths]),
+        ).fetchall()
+        if len(found) != len(paths):
+            raise HTTPException(status_code=422, detail="أحد مسارات الإدارة والقسم غير موجود.")
+        return [f"{a}:{b}" for a,b in paths]
     if category not in REF_PARENTS:
         return []
     if not isinstance(parent_ids, list):
@@ -775,6 +807,28 @@ def validate_parent_ids(category: str, parent_ids: Any, conn) -> list[int]:
 
 
 def replace_reference_parents(conn, category: str, item_id: int, parent_ids: list[int], current_name: str):
+    if category == "job_titles":
+        wanted = {(int(v.split(":")[0]),int(v.split(":")[1])) for v in parent_ids}
+        current = conn.execute("SELECT directorate_id,department_id FROM public.ref_directorate_department_job_titles WHERE job_title_id=%s",(item_id,)).fetchall()
+        old = {(int(r["directorate_id"]),int(r["department_id"])) for r in current}
+        removed = old - wanted
+        if removed:
+            usage = conn.execute(
+                """SELECT count(*) AS n FROM public.employees e
+                   JOIN public.ref_directorates d ON d.name=e.directorate
+                   JOIN public.ref_departments p ON p.name=e.department
+                   WHERE e.job_title=%s AND (d.id,p.id) IN (SELECT * FROM unnest(%s::bigint[],%s::bigint[]))""",
+                (current_name,[x[0] for x in removed],[x[1] for x in removed]),
+            ).fetchone()["n"]
+            if usage:
+                raise HTTPException(status_code=409,detail="لا يمكن إزالة مسار إدارة/قسم مستخدم في سجل موظف.")
+        conn.execute("DELETE FROM public.ref_directorate_department_job_titles WHERE job_title_id=%s",(item_id,))
+        for directorate_id,department_id in wanted:
+            conn.execute("INSERT INTO public.ref_directorate_department_job_titles(directorate_id,department_id,job_title_id) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",(directorate_id,department_id,item_id))
+        conn.execute("DELETE FROM public.ref_department_job_titles WHERE job_title_id=%s",(item_id,))
+        for department_id in sorted({x[1] for x in wanted}):
+            conn.execute("INSERT INTO public.ref_department_job_titles(department_id,job_title_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",(department_id,item_id))
+        return
     if category not in REF_PARENTS:
         return
     link_table, parent_id_col, member_id_col, parent_table, parent_emp_col, member_emp_col = REF_PARENTS[category]
@@ -789,6 +843,13 @@ def replace_reference_parents(conn, category: str, item_id: int, parent_ids: lis
             continue
         parent = conn.execute(f"SELECT name FROM public.{parent_table} WHERE id=%s", (parent_id,)).fetchone()
         if parent:
+            if category == "departments":
+                protected = conn.execute(
+                    "SELECT count(*) AS n FROM public.ref_directorate_department_job_titles WHERE directorate_id=%s AND department_id=%s",
+                    (parent_id,item_id),
+                ).fetchone()["n"]
+                if protected:
+                    raise HTTPException(status_code=409,detail="لا يمكن إزالة الإدارة لأن هناك مسميات وظيفية مرتبطة بهذا القسم ضمنها.")
             usage = conn.execute(
                 f"SELECT count(*) AS n FROM public.employees WHERE {parent_emp_col}=%s AND {member_emp_col}=%s",
                 (parent["name"], current_name),
@@ -826,7 +887,7 @@ async def create_reference_value(category: str, request: Request):
                 f"INSERT INTO public.{table}(name) VALUES (%s) RETURNING id,name",
                 (name,),
             ).fetchone()
-            if category in REF_PARENTS:
+            if category in REF_PARENTS or category == "job_titles":
                 replace_reference_parents(conn,category,row["id"],parent_ids,name)
     except psycopg.errors.UniqueViolation:
         raise HTTPException(status_code=409, detail="هذا الاسم موجود بالفعل في القائمة.")
@@ -853,8 +914,8 @@ async def rename_reference_value(category: str, item_id: int, request: Request):
         duplicate = conn.execute(f"SELECT id FROM public.{table} WHERE name=%s AND id<>%s", (name,item_id)).fetchone()
         if duplicate:
             raise HTTPException(status_code=409, detail="يوجد عنصر آخر بالاسم نفسه.")
-        parent_ids = validate_parent_ids(category,payload.get("parent_ids",[]),conn) if category in REF_PARENTS else []
-        if category in REF_PARENTS:
+        parent_ids = validate_parent_ids(category,payload.get("parent_ids",[]),conn) if category in REF_PARENTS or category == "job_titles" else []
+        if category in REF_PARENTS or category == "job_titles":
             replace_reference_parents(conn,category,item_id,parent_ids,current["name"])
         conn.execute(f"UPDATE public.{table} SET name=%s WHERE id=%s", (name,item_id))
         conn.execute(
@@ -876,11 +937,11 @@ def delete_reference_value(category: str, item_id: int, request: Request):
         if category == "work_centers":
             relation_count = conn.execute("SELECT count(*) AS n FROM public.ref_center_directorates WHERE center_id=%s",(item_id,)).fetchone()["n"]
         elif category == "directorates":
-            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_center_directorates WHERE directorate_id=%s)+(SELECT count(*) FROM public.ref_directorate_departments WHERE directorate_id=%s) AS n",(item_id,item_id)).fetchone()["n"]
+            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_center_directorates WHERE directorate_id=%s)+(SELECT count(*) FROM public.ref_directorate_departments WHERE directorate_id=%s)+(SELECT count(*) FROM public.ref_directorate_department_job_titles WHERE directorate_id=%s) AS n",(item_id,item_id,item_id)).fetchone()["n"]
         elif category == "departments":
-            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_directorate_departments WHERE department_id=%s)+(SELECT count(*) FROM public.ref_department_job_titles WHERE department_id=%s) AS n",(item_id,item_id)).fetchone()["n"]
+            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_directorate_departments WHERE department_id=%s)+(SELECT count(*) FROM public.ref_department_job_titles WHERE department_id=%s)+(SELECT count(*) FROM public.ref_directorate_department_job_titles WHERE department_id=%s) AS n",(item_id,item_id,item_id)).fetchone()["n"]
         elif category == "job_titles":
-            relation_count = conn.execute("SELECT count(*) AS n FROM public.ref_department_job_titles WHERE job_title_id=%s",(item_id,)).fetchone()["n"]
+            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_department_job_titles WHERE job_title_id=%s)+(SELECT count(*) FROM public.ref_directorate_department_job_titles WHERE job_title_id=%s) AS n",(item_id,item_id)).fetchone()["n"]
         used = conn.execute(f"SELECT count(*) AS n FROM public.employees WHERE {employee_column}=%s",(current["name"],)).fetchone()["n"]
         if relation_count or used:
             raise HTTPException(status_code=409,detail=f"لا يمكن حذف {label} «{current['name']}» لأنه مرتبط بموظفين أو بعلاقات تنظيمية. أزل الارتباطات أولًا.")
