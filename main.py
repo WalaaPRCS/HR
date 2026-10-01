@@ -547,7 +547,8 @@ async def import_employees(request: Request, file: UploadFile = File(...)):
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (7210042026,))
             if conn.execute("SELECT id FROM public.employee_import_control WHERE id = 1").fetchone():
                 raise HTTPException(status_code=409, detail="تم استيراد ملف الموظفين مسبقاً؛ الاستيراد متاح مرة واحدة فقط.")
-            conn.executemany(INSERT_SQL, rows)
+            with conn.cursor() as cursor:
+                cursor.executemany(INSERT_SQL, rows)
             conn.execute(
                 """INSERT INTO public.employee_import_control
                    (id, source_filename, sha256, imported_rows, imported_by)
