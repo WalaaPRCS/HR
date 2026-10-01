@@ -1,9 +1,9 @@
 .git
 .github
-.gitignore
-README.md
-*.xlsx
-*.csv
-*.sql
 .env
 .env.*
+*.xlsx
+*.csv
+__pycache__/
+*.py[cod]
+.pytest_cache/
