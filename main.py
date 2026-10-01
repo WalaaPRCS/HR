@@ -693,39 +693,188 @@ def root_page(request: Request):
 
 
 
+
+REF_TABLES = {
+    "work_centers": ("ref_work_centers", "work_center", "مركز العمل"),
+    "directorates": ("ref_directorates", "directorate", "الدائرة / الإدارة"),
+    "departments": ("ref_departments", "department", "القسم"),
+    "job_titles": ("ref_job_titles", "job_title", "المسمى الوظيفي"),
+    "employment_statuses": ("ref_employment_statuses", "employment_status", "الحالة"),
+    "cadre_types": ("ref_cadre_types", "cadre_type", "نوع الكادر"),
+}
+REF_LINKS = {
+    "center_directorates": ("ref_center_directorates", "center_id", "directorate_id", "ref_work_centers", "ref_directorates", "work_center", "directorate"),
+    "directorate_departments": ("ref_directorate_departments", "directorate_id", "department_id", "ref_directorates", "ref_departments", "directorate", "department"),
+    "department_job_titles": ("ref_department_job_titles", "department_id", "job_title_id", "ref_departments", "ref_job_titles", "department", "job_title"),
+}
+
+
+def valid_reference_category(category: str):
+    item = REF_TABLES.get(category)
+    if not item:
+        raise HTTPException(status_code=404, detail="نوع القائمة غير معروف.")
+    return item
+
+
 @app.get("/api/settings/reference-data")
 def reference_data():
     with connect() as conn:
         data = {
-            "work_centers": conn.execute("SELECT id, name FROM public.ref_work_centers ORDER BY name").fetchall(),
-            "directorates": conn.execute("SELECT id, name FROM public.ref_directorates ORDER BY name").fetchall(),
-            "departments": conn.execute("SELECT id, name FROM public.ref_departments ORDER BY name").fetchall(),
-            "job_titles": conn.execute("SELECT id, name FROM public.ref_job_titles ORDER BY name").fetchall(),
-            "employment_statuses": conn.execute("SELECT id, name FROM public.ref_employment_statuses ORDER BY name").fetchall(),
-            "cadre_types": conn.execute("SELECT id, name FROM public.ref_cadre_types ORDER BY name").fetchall(),
-            "center_directorates": conn.execute(
-                """SELECT c.name AS work_center, d.name AS directorate
-                   FROM public.ref_center_directorates x
-                   JOIN public.ref_work_centers c ON c.id=x.center_id
-                   JOIN public.ref_directorates d ON d.id=x.directorate_id
-                   ORDER BY c.name,d.name"""
-            ).fetchall(),
-            "directorate_departments": conn.execute(
-                """SELECT d.name AS directorate, p.name AS department
-                   FROM public.ref_directorate_departments x
-                   JOIN public.ref_directorates d ON d.id=x.directorate_id
-                   JOIN public.ref_departments p ON p.id=x.department_id
-                   ORDER BY d.name,p.name"""
-            ).fetchall(),
-            "department_job_titles": conn.execute(
-                """SELECT p.name AS department, j.name AS job_title
-                   FROM public.ref_department_job_titles x
-                   JOIN public.ref_departments p ON p.id=x.department_id
-                   JOIN public.ref_job_titles j ON j.id=x.job_title_id
-                   ORDER BY p.name,j.name"""
-            ).fetchall(),
+            key: conn.execute(f"SELECT id, name FROM public.{table} ORDER BY name").fetchall()
+            for key, (table, _employee_column, _label) in REF_TABLES.items()
         }
+        data["center_directorates"] = conn.execute(
+            """SELECT x.center_id AS left_id,x.directorate_id AS right_id,
+                      c.name AS left_name,d.name AS right_name
+               FROM public.ref_center_directorates x
+               JOIN public.ref_work_centers c ON c.id=x.center_id
+               JOIN public.ref_directorates d ON d.id=x.directorate_id
+               ORDER BY c.name,d.name"""
+        ).fetchall()
+        data["directorate_departments"] = conn.execute(
+            """SELECT x.directorate_id AS left_id,x.department_id AS right_id,
+                      d.name AS left_name,p.name AS right_name
+               FROM public.ref_directorate_departments x
+               JOIN public.ref_directorates d ON d.id=x.directorate_id
+               JOIN public.ref_departments p ON p.id=x.department_id
+               ORDER BY d.name,p.name"""
+        ).fetchall()
+        data["department_job_titles"] = conn.execute(
+            """SELECT x.department_id AS left_id,x.job_title_id AS right_id,
+                      p.name AS left_name,j.name AS right_name
+               FROM public.ref_department_job_titles x
+               JOIN public.ref_departments p ON p.id=x.department_id
+               JOIN public.ref_job_titles j ON j.id=x.job_title_id
+               ORDER BY p.name,j.name"""
+        ).fetchall()
     return data
+
+
+@app.post("/api/settings/reference-data/{category}")
+async def create_reference_value(category: str, request: Request):
+    table, _employee_column, label = valid_reference_category(category)
+    check_same_origin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="بيانات القائمة غير صالحة.")
+    name = clean_text(payload.get("name") if isinstance(payload, dict) else None)
+    if not name:
+        raise HTTPException(status_code=422, detail=f"أدخل {label}.")
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                f"INSERT INTO public.{table}(name) VALUES (%s) RETURNING id,name",
+                (name,),
+            ).fetchone()
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="هذا الاسم موجود بالفعل في القائمة.")
+    return row
+
+
+@app.patch("/api/settings/reference-data/{category}/{item_id}")
+async def rename_reference_value(category: str, item_id: int, request: Request):
+    table, employee_column, label = valid_reference_category(category)
+    check_same_origin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="بيانات التعديل غير صالحة.")
+    name = clean_text(payload.get("name") if isinstance(payload, dict) else None)
+    if not name:
+        raise HTTPException(status_code=422, detail=f"أدخل {label}.")
+    with connect() as conn:
+        current = conn.execute(f"SELECT id,name FROM public.{table} WHERE id=%s FOR UPDATE", (item_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="العنصر غير موجود.")
+        duplicate = conn.execute(f"SELECT id FROM public.{table} WHERE name=%s AND id<>%s", (name,item_id)).fetchone()
+        if duplicate:
+            raise HTTPException(status_code=409, detail="يوجد عنصر آخر بالاسم نفسه.")
+        conn.execute(f"UPDATE public.{table} SET name=%s WHERE id=%s", (name,item_id))
+        conn.execute(
+            f"UPDATE public.employees SET {employee_column}=%s,updated_at=NOW() WHERE {employee_column}=%s",
+            (name,current["name"]),
+        )
+        return {"id": item_id, "name": name}
+
+
+@app.delete("/api/settings/reference-data/{category}/{item_id}")
+def delete_reference_value(category: str, item_id: int, request: Request):
+    table, employee_column, label = valid_reference_category(category)
+    check_same_origin(request)
+    with connect() as conn:
+        current = conn.execute(f"SELECT id,name FROM public.{table} WHERE id=%s FOR UPDATE", (item_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="العنصر غير موجود.")
+        relation_count = 0
+        if category == "work_centers":
+            relation_count = conn.execute("SELECT count(*) AS n FROM public.ref_center_directorates WHERE center_id=%s",(item_id,)).fetchone()["n"]
+        elif category == "directorates":
+            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_center_directorates WHERE directorate_id=%s)+(SELECT count(*) FROM public.ref_directorate_departments WHERE directorate_id=%s) AS n",(item_id,item_id)).fetchone()["n"]
+        elif category == "departments":
+            relation_count = conn.execute("SELECT (SELECT count(*) FROM public.ref_directorate_departments WHERE department_id=%s)+(SELECT count(*) FROM public.ref_department_job_titles WHERE department_id=%s) AS n",(item_id,item_id)).fetchone()["n"]
+        elif category == "job_titles":
+            relation_count = conn.execute("SELECT count(*) AS n FROM public.ref_department_job_titles WHERE job_title_id=%s",(item_id,)).fetchone()["n"]
+        used = conn.execute(f"SELECT count(*) AS n FROM public.employees WHERE {employee_column}=%s",(current["name"],)).fetchone()["n"]
+        if relation_count or used:
+            raise HTTPException(status_code=409,detail=f"لا يمكن حذف {label} «{current['name']}» لأنه مرتبط بموظفين أو بعلاقات تنظيمية. أزل الارتباطات أولًا.")
+        conn.execute(f"DELETE FROM public.{table} WHERE id=%s",(item_id,))
+    return {"ok": True}
+
+
+@app.post("/api/settings/reference-links/{relation}")
+async def create_reference_link(relation: str, request: Request):
+    config = REF_LINKS.get(relation)
+    if not config:
+        raise HTTPException(status_code=404, detail="نوع الارتباط غير معروف.")
+    link_table,left_col,right_col,left_table,right_table,left_key,right_key=config
+    check_same_origin(request)
+    try:
+        payload=await request.json()
+        left_id=int(payload.get("left_id"))
+        right_id=int(payload.get("right_id"))
+    except Exception:
+        raise HTTPException(status_code=422,detail="اختر طرفي الارتباط.")
+    try:
+        with connect() as conn:
+            exists=conn.execute(
+                f"SELECT (SELECT count(*) FROM public.{left_table} WHERE id=%s)+(SELECT count(*) FROM public.{right_table} WHERE id=%s) AS n",
+                (left_id,right_id),
+            ).fetchone()["n"]
+            if exists!=2:
+                raise HTTPException(status_code=404,detail="أحد عناصر الارتباط غير موجود.")
+            conn.execute(
+                f"INSERT INTO public.{link_table}({left_col},{right_col}) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                (left_id,right_id),
+            )
+    except psycopg.Error:
+        raise HTTPException(status_code=500,detail="تعذر حفظ الارتباط.")
+    return {"ok":True}
+
+
+@app.delete("/api/settings/reference-links/{relation}/{left_id}/{right_id}")
+def delete_reference_link(relation: str,left_id: int,right_id: int,request: Request):
+    config=REF_LINKS.get(relation)
+    if not config:
+        raise HTTPException(status_code=404,detail="نوع الارتباط غير معروف.")
+    link_table,left_col,right_col,left_table,right_table,left_key,right_key=config
+    check_same_origin(request)
+    with connect() as conn:
+        left=conn.execute(f"SELECT name FROM public.{left_table} WHERE id=%s",(left_id,)).fetchone()
+        right=conn.execute(f"SELECT name FROM public.{right_table} WHERE id=%s",(right_id,)).fetchone()
+        if not left or not right:
+            raise HTTPException(status_code=404,detail="أحد عناصر الارتباط غير موجود.")
+        employee_usage=conn.execute(
+            f"SELECT count(*) AS n FROM public.employees WHERE {left_key}=%s AND {right_key}=%s",
+            (left["name"],right["name"]),
+        ).fetchone()["n"]
+        if employee_usage:
+            raise HTTPException(status_code=409,detail="لا يمكن حذف هذا الارتباط لأنه مستخدم في سجل موظف.")
+        conn.execute(
+            f"DELETE FROM public.{link_table} WHERE {left_col}=%s AND {right_col}=%s",
+            (left_id,right_id),
+        )
+    return {"ok":True}
 
 
 app.mount("/", StaticFiles(directory=PUBLIC_DIR, html=True), name="public")
