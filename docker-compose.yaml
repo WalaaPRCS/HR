@@ -5,24 +5,41 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     expose:
-      - "80"
+      - "8000"
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-prcs_hr}
+      DB_USER: ${POSTGRES_USER:-prcs_hr_app}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify before deployment}
+      HR_ADMIN_USERNAME: ${HR_ADMIN_USERNAME:?Set HR_ADMIN_USERNAME in Coolify before deployment}
+      HR_ADMIN_PASSWORD: ${HR_ADMIN_PASSWORD:?Set HR_ADMIN_PASSWORD in Coolify before deployment}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in Coolify before deployment}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3)"
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 25s
 
   db:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: "${POSTGRES_DB:-prcs_hr}"
-      POSTGRES_USER: "${POSTGRES_USER:-prcs_hr_app}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify before deployment}"
+      POSTGRES_DB: ${POSTGRES_DB:-prcs_hr}
+      POSTGRES_USER: ${POSTGRES_USER:-prcs_hr_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in Coolify before deployment}
     volumes:
       - hr_postgres_data:/var/lib/postgresql/data
-      - ./database/migrations/001_create_employees.sql:/docker-entrypoint-initdb.d/001_create_employees.sql:ro
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
