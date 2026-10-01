@@ -356,7 +356,7 @@ def list_employees(
         ).fetchone()["total"]
         items = conn.execute(
             f"""SELECT employee_number, employee_name, work_center, directorate, department,
-                       job_title, cadre_type, employment_status, project, grade
+                       job_title, cadre_type, employment_status, project, grade, is_frozen
                 FROM public.employees{where_sql}
                 ORDER BY directorate NULLS LAST, employee_name
                 LIMIT %s OFFSET %s""",
@@ -369,6 +369,127 @@ def list_employees(
         "page_size": page_size,
         "pages": (total + page_size - 1) // page_size,
     }
+
+
+
+@app.get("/api/employees/{employee_number}")
+def employee_details(employee_number: str):
+    with connect() as conn:
+        employee = conn.execute(
+            """SELECT employee_number, employee_name, work_center, directorate, department,
+                      job_title, cadre_type, employment_status, salary, next_grade_due_date,
+                      coverage_percentage, project, grade, employee_code, is_frozen, frozen_at, frozen_by
+               FROM public.employees WHERE employee_number = %s""",
+            (employee_number,),
+        ).fetchone()
+    if not employee:
+        raise HTTPException(status_code=404, detail="لم يتم العثور على الموظف.")
+    return employee
+
+
+EDITABLE_FIELDS = (
+    "employee_number", "employee_name", "work_center", "directorate", "department",
+    "job_title", "cadre_type", "employment_status", "salary", "next_grade_due_date",
+    "coverage_percentage", "project", "grade", "employee_code",
+)
+REQUIRED_EMPLOYEE_FIELDS = {
+    "employee_number", "employee_name", "work_center", "job_title",
+    "cadre_type", "employment_status", "employee_code",
+}
+
+
+def validate_employee_update(payload: dict[str, Any]) -> tuple[Any, ...]:
+    employee: dict[str, Any] = {}
+    for key in EDITABLE_FIELDS:
+        value = payload.get(key)
+        try:
+            if key in ("employee_number", "employee_code"):
+                employee[key] = clean_identifier(value)
+            elif key in ("salary", "coverage_percentage"):
+                employee[key] = clean_decimal(value)
+            elif key == "next_grade_due_date":
+                employee[key] = clean_date(value)
+            else:
+                employee[key] = clean_text(value)
+        except (ValueError, InvalidOperation, OverflowError):
+            raise HTTPException(status_code=422, detail=f"قيمة غير صالحة في الحقل: {key}")
+    missing = sorted(key for key in REQUIRED_EMPLOYEE_FIELDS if not employee.get(key))
+    if missing:
+        raise HTTPException(status_code=422, detail="أكمل الحقول الإلزامية قبل الحفظ.")
+    return tuple(employee[key] for key in EDITABLE_FIELDS)
+
+
+@app.put("/api/employees/{employee_number}")
+async def update_employee(employee_number: str, request: Request):
+    check_same_origin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="بيانات التعديل غير صالحة.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="بيانات التعديل غير صالحة.")
+    values = validate_employee_update(payload)
+    try:
+        with connect() as conn:
+            current = conn.execute(
+                "SELECT is_frozen FROM public.employees WHERE employee_number = %s FOR UPDATE",
+                (employee_number,),
+            ).fetchone()
+            if not current:
+                raise HTTPException(status_code=404, detail="لم يتم العثور على الموظف.")
+            if current["is_frozen"]:
+                raise HTTPException(status_code=423, detail="ملف الموظف مجمّد. أعد تفعيله قبل التعديل.")
+            conn.execute(
+                """UPDATE public.employees SET
+                       employee_number=%s, employee_name=%s, work_center=%s, directorate=%s,
+                       department=%s, job_title=%s, cadre_type=%s, employment_status=%s,
+                       salary=%s, next_grade_due_date=%s, coverage_percentage=%s, project=%s,
+                       grade=%s, employee_code=%s, updated_at=NOW()
+                   WHERE employee_number=%s""",
+                (*values, employee_number),
+            )
+    except HTTPException:
+        raise
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="رقم الموظف أو كوده مستخدم في سجل آخر.")
+    except psycopg.errors.CheckViolation:
+        raise HTTPException(status_code=422, detail="تحقق من أن الراتب ونسبة التغطية أرقام غير سالبة.")
+    except psycopg.Error:
+        raise HTTPException(status_code=500, detail="تعذر حفظ التعديلات.")
+    return {"ok": True, "employee_number": values[0]}
+
+
+@app.post("/api/employees/{employee_number}/freeze")
+def freeze_employee(employee_number: str, request: Request):
+    check_same_origin(request)
+    username = authenticated_username(request) or "admin"
+    with connect() as conn:
+        row = conn.execute(
+            """UPDATE public.employees
+               SET is_frozen=TRUE, frozen_at=NOW(), frozen_by=%s, updated_at=NOW()
+               WHERE employee_number=%s
+               RETURNING employee_number""",
+            (username, employee_number),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="لم يتم العثور على الموظف.")
+    return {"ok": True, "is_frozen": True}
+
+
+@app.post("/api/employees/{employee_number}/unfreeze")
+def unfreeze_employee(employee_number: str, request: Request):
+    check_same_origin(request)
+    with connect() as conn:
+        row = conn.execute(
+            """UPDATE public.employees
+               SET is_frozen=FALSE, frozen_at=NULL, frozen_by=NULL, updated_at=NOW()
+               WHERE employee_number=%s
+               RETURNING employee_number""",
+            (employee_number,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="لم يتم العثور على الموظف.")
+    return {"ok": True, "is_frozen": False}
 
 
 @app.get("/api/import-status")
