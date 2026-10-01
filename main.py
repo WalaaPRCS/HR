@@ -419,6 +419,35 @@ def validate_employee_update(payload: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(employee[key] for key in EDITABLE_FIELDS)
 
 
+def validate_employee_settings(conn, values: tuple[Any, ...]):
+    employee = dict(zip(EDITABLE_FIELDS, values))
+    for field, table, label in [
+        ("work_center", "ref_work_centers", "مركز العمل"),
+        ("cadre_type", "ref_cadre_types", "نوع الكادر"),
+        ("employment_status", "ref_employment_statuses", "الحالة"),
+    ]:
+        if not conn.execute(f"SELECT 1 FROM public.{table} WHERE name=%s", (employee[field],)).fetchone():
+            raise HTTPException(status_code=422, detail=f"القيمة المختارة في «{label}» غير موجودة في الإعدادات.")
+    directorate = employee.get("directorate")
+    department = employee.get("department")
+    if directorate:
+        linked = conn.execute("""SELECT 1 FROM public.ref_center_directorates x JOIN public.ref_work_centers c ON c.id=x.center_id JOIN public.ref_directorates d ON d.id=x.directorate_id WHERE c.name=%s AND d.name=%s""", (employee["work_center"], directorate)).fetchone()
+        if not linked:
+            raise HTTPException(status_code=422, detail="الإدارة المختارة غير مرتبطة بمركز العمل المحدد.")
+    if department:
+        if not directorate:
+            raise HTTPException(status_code=422, detail="اختر الإدارة قبل اختيار القسم.")
+        linked = conn.execute("""SELECT 1 FROM public.ref_directorate_departments x JOIN public.ref_directorates d ON d.id=x.directorate_id JOIN public.ref_departments p ON p.id=x.department_id WHERE d.name=%s AND p.name=%s""", (directorate, department)).fetchone()
+        if not linked:
+            raise HTTPException(status_code=422, detail="القسم المختار غير مرتبط بالإدارة المحددة.")
+    title = employee.get("job_title")
+    if title:
+        if not directorate or not department:
+            raise HTTPException(status_code=422, detail="اختر الإدارة والقسم قبل اختيار المسمى الوظيفي.")
+        linked = conn.execute("""SELECT 1 FROM public.ref_directorate_department_job_titles x JOIN public.ref_directorates d ON d.id=x.directorate_id JOIN public.ref_departments p ON p.id=x.department_id JOIN public.ref_job_titles j ON j.id=x.job_title_id WHERE d.name=%s AND p.name=%s AND j.name=%s""", (directorate, department, title)).fetchone()
+        if not linked:
+            raise HTTPException(status_code=422, detail="المسمى الوظيفي المختار غير مرتبط بالقسم والإدارة في الإعدادات.")
+
 @app.put("/api/employees/{employee_number}")
 async def update_employee(employee_number: str, request: Request):
     check_same_origin(request)
@@ -439,6 +468,7 @@ async def update_employee(employee_number: str, request: Request):
                 raise HTTPException(status_code=404, detail="لم يتم العثور على الموظف.")
             if current["is_frozen"]:
                 raise HTTPException(status_code=423, detail="ملف الموظف مجمّد. أعد تفعيله قبل التعديل.")
+            validate_employee_settings(conn, values)
             conn.execute(
                 """UPDATE public.employees SET
                        employee_number=%s, employee_name=%s, work_center=%s, directorate=%s,
