@@ -702,6 +702,11 @@ REF_TABLES = {
     "employment_statuses": ("ref_employment_statuses", "employment_status", "الحالة"),
     "cadre_types": ("ref_cadre_types", "cadre_type", "نوع الكادر"),
 }
+REF_PARENTS = {
+    "directorates": ("ref_center_directorates", "center_id", "directorate_id", "ref_work_centers", "work_center", "directorate"),
+    "departments": ("ref_directorate_departments", "directorate_id", "department_id", "ref_directorates", "directorate", "department"),
+    "job_titles": ("ref_department_job_titles", "department_id", "job_title_id", "ref_departments", "department", "job_title"),
+}
 REF_LINKS = {
     "center_directorates": ("ref_center_directorates", "center_id", "directorate_id", "ref_work_centers", "ref_directorates", "work_center", "directorate"),
     "directorate_departments": ("ref_directorate_departments", "directorate_id", "department_id", "ref_directorates", "ref_departments", "directorate", "department"),
@@ -750,6 +755,57 @@ def reference_data():
     return data
 
 
+
+def validate_parent_ids(category: str, parent_ids: Any, conn) -> list[int]:
+    if category not in REF_PARENTS:
+        return []
+    if not isinstance(parent_ids, list):
+        raise HTTPException(status_code=422, detail="حدد العناصر المرتبطة من الهيكل التنظيمي.")
+    try:
+        ids = sorted({int(value) for value in parent_ids})
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="قائمة الارتباطات غير صالحة.")
+    if not ids:
+        raise HTTPException(status_code=422, detail="حدد ارتباطًا واحدًا على الأقل من الهيكل التنظيمي.")
+    _link_table, parent_id_col, _member_id_col, parent_table, _parent_emp_col, _member_emp_col = REF_PARENTS[category]
+    found = conn.execute(f"SELECT id FROM public.{parent_table} WHERE id=ANY(%s)", (ids,)).fetchall()
+    if len(found) != len(ids):
+        raise HTTPException(status_code=422, detail="تتضمن الارتباطات المختارة قيمة غير موجودة.")
+    return ids
+
+
+def replace_reference_parents(conn, category: str, item_id: int, parent_ids: list[int], current_name: str):
+    if category not in REF_PARENTS:
+        return
+    link_table, parent_id_col, member_id_col, parent_table, parent_emp_col, member_emp_col = REF_PARENTS[category]
+    current_links = conn.execute(
+        f"SELECT {parent_id_col} AS parent_id FROM public.{link_table} WHERE {member_id_col}=%s",
+        (item_id,),
+    ).fetchall()
+    selected = set(parent_ids)
+    for link_row in current_links:
+        parent_id = link_row["parent_id"]
+        if parent_id in selected:
+            continue
+        parent = conn.execute(f"SELECT name FROM public.{parent_table} WHERE id=%s", (parent_id,)).fetchone()
+        if parent:
+            usage = conn.execute(
+                f"SELECT count(*) AS n FROM public.employees WHERE {parent_emp_col}=%s AND {member_emp_col}=%s",
+                (parent["name"], current_name),
+            ).fetchone()["n"]
+            if usage:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"لا يمكن إزالة «{parent['name']}» من الهيكل؛ يوجد {REF_TABLES[category][2]} مستخدم بهذا الارتباط في سجل موظف.",
+                )
+    conn.execute(f"DELETE FROM public.{link_table} WHERE {member_id_col}=%s", (item_id,))
+    for parent_id in parent_ids:
+        conn.execute(
+            f"INSERT INTO public.{link_table}({parent_id_col},{member_id_col}) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+            (parent_id,item_id),
+        )
+
+
 @app.post("/api/settings/reference-data/{category}")
 async def create_reference_value(category: str, request: Request):
     table, _employee_column, label = valid_reference_category(category)
@@ -758,15 +814,20 @@ async def create_reference_value(category: str, request: Request):
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="بيانات القائمة غير صالحة.")
-    name = clean_text(payload.get("name") if isinstance(payload, dict) else None)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="بيانات القائمة غير صالحة.")
+    name = clean_text(payload.get("name"))
     if not name:
         raise HTTPException(status_code=422, detail=f"أدخل {label}.")
     try:
         with connect() as conn:
+            parent_ids = validate_parent_ids(category, payload.get("parent_ids", []), conn)
             row = conn.execute(
                 f"INSERT INTO public.{table}(name) VALUES (%s) RETURNING id,name",
                 (name,),
             ).fetchone()
+            if category in REF_PARENTS:
+                replace_reference_parents(conn,category,row["id"],parent_ids,name)
     except psycopg.errors.UniqueViolation:
         raise HTTPException(status_code=409, detail="هذا الاسم موجود بالفعل في القائمة.")
     return row
@@ -780,7 +841,9 @@ async def rename_reference_value(category: str, item_id: int, request: Request):
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="بيانات التعديل غير صالحة.")
-    name = clean_text(payload.get("name") if isinstance(payload, dict) else None)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="بيانات التعديل غير صالحة.")
+    name = clean_text(payload.get("name"))
     if not name:
         raise HTTPException(status_code=422, detail=f"أدخل {label}.")
     with connect() as conn:
@@ -790,12 +853,15 @@ async def rename_reference_value(category: str, item_id: int, request: Request):
         duplicate = conn.execute(f"SELECT id FROM public.{table} WHERE name=%s AND id<>%s", (name,item_id)).fetchone()
         if duplicate:
             raise HTTPException(status_code=409, detail="يوجد عنصر آخر بالاسم نفسه.")
+        parent_ids = validate_parent_ids(category,payload.get("parent_ids",[]),conn) if category in REF_PARENTS else []
+        if category in REF_PARENTS:
+            replace_reference_parents(conn,category,item_id,parent_ids,current["name"])
         conn.execute(f"UPDATE public.{table} SET name=%s WHERE id=%s", (name,item_id))
         conn.execute(
             f"UPDATE public.employees SET {employee_column}=%s,updated_at=NOW() WHERE {employee_column}=%s",
             (name,current["name"]),
         )
-        return {"id": item_id, "name": name}
+    return {"id": item_id, "name": name}
 
 
 @app.delete("/api/settings/reference-data/{category}/{item_id}")
