@@ -1297,6 +1297,9 @@ async def update_workforce_requirement(item_id: int, request: Request):
     payload = await request.json()
     if not isinstance(payload,dict):
         raise HTTPException(status_code=400,detail="بيانات الاحتياج غير صالحة.")
+    service_line=payload.get("service_line")
+    if service_line not in {"hospitals","primary_care","emergency"}:
+        raise HTTPException(status_code=422,detail="اختر نوع التخطيط.")
     location=clean_text(payload.get("location_name"))
     if not location:
         raise HTTPException(status_code=422,detail="أدخل اسم المنشأة أو الموقع.")
@@ -1307,10 +1310,10 @@ async def update_workforce_requirement(item_id: int, request: Request):
         try:
             conn.execute(
                 """UPDATE public.workforce_requirements
-                   SET location_name=%s,work_center_id=%s,directorate_id=%s,department_id=%s,
+                   SET service_line=%s,location_name=%s,work_center_id=%s,directorate_id=%s,department_id=%s,
                        job_title_id=%s,required_count=%s,updated_at=NOW()
                    WHERE id=%s""",
-                (location,center_id,directorate_id,department_id,job_id,required,item_id),
+                (service_line,location,center_id,directorate_id,department_id,job_id,required,item_id),
             )
         except psycopg.errors.UniqueViolation:
             raise HTTPException(status_code=409,detail="يوجد احتياج آخر بالمسار نفسه لهذا الموقع.")
