@@ -1042,7 +1042,7 @@ def normalize_reference_label(value: Any) -> str:
     text = str(value).strip().lower().replace("ـ", "")
     text = "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
     text = text.translate(str.maketrans({"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ة":"ه","ؤ":"و","ئ":"ي"}))
-    return re.sub(r"\\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _planning_ref_maps(conn):
@@ -1094,7 +1094,7 @@ def _planning_source_rows(workbook, service_line: str, source_filename: str, ref
             loc = ws.cell(3, col).value
             if not loc or "مجموع" in str(loc):
                 continue
-            location = re.sub(r"\\s*[-–]\\s*مستوى رابع\\s*", "", str(loc)).strip()
+            location = re.sub(r"\s*[-–]\s*مستوى رابع\s*", "", str(loc)).strip()
             department = _planning_match(refs, "departments", location)
             blocks.append((col, location, center, directorate, department))
     else:
