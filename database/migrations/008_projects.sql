@@ -25,3 +25,20 @@ CREATE INDEX IF NOT EXISTS project_positions_project_idx
   ON public.project_positions(project_id);
 CREATE INDEX IF NOT EXISTS project_positions_title_idx
   ON public.project_positions(job_title_id);
+
+-- Seed project names and initial positions from employee assignments already loaded in HR.
+INSERT INTO public.projects(name)
+SELECT DISTINCT BTRIM(project)
+FROM public.employees
+WHERE NULLIF(BTRIM(project),'') IS NOT NULL
+ON CONFLICT(name) DO NOTHING;
+
+INSERT INTO public.project_positions(project_id,job_title_id,title_label,planned_count,budget_amount)
+SELECT p.id,j.id,BTRIM(e.job_title),COUNT(*)::INTEGER,0
+FROM public.employees e
+JOIN public.projects p ON p.name=BTRIM(e.project)
+LEFT JOIN public.ref_job_titles j ON LOWER(BTRIM(j.name))=LOWER(BTRIM(e.job_title))
+WHERE NULLIF(BTRIM(e.project),'') IS NOT NULL
+  AND NULLIF(BTRIM(e.job_title),'') IS NOT NULL
+GROUP BY p.id,j.id,BTRIM(e.job_title)
+ON CONFLICT(project_id,title_label) DO NOTHING;
