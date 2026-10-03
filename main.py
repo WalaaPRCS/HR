@@ -1222,8 +1222,9 @@ def list_workforce_requirements(service_line: str = "", location_name: str = "",
                                    WHERE cd.center_id=p.work_center_id AND cd.directorate_id=p.directorate_id)
                        AND EXISTS (SELECT 1 FROM public.ref_directorate_departments dd
                                    WHERE dd.directorate_id=p.directorate_id AND dd.department_id=p.department_id)
-                       AND EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles jt
+                       AND (EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles jt
                                    WHERE jt.directorate_id=p.directorate_id AND jt.department_id=p.department_id AND jt.job_title_id=p.job_title_id)
+                       OR EXISTS (SELECT 1 FROM public.employees e WHERE e.work_center=c.name AND e.directorate=d.name AND e.department=dep.name AND e.job_title=j.name AND e.employment_status='على رأس عمله'))
                       ) AS mapping_complete
                FROM public.workforce_requirements p
                LEFT JOIN public.ref_work_centers c ON c.id=p.work_center_id
@@ -1261,7 +1262,8 @@ def _validate_requirement_payload(conn, payload):
            WHERE c.id=%s
              AND EXISTS (SELECT 1 FROM public.ref_center_directorates x WHERE x.center_id=c.id AND x.directorate_id=d.id)
              AND EXISTS (SELECT 1 FROM public.ref_directorate_departments x WHERE x.directorate_id=d.id AND x.department_id=dep.id)
-             AND EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles x WHERE x.directorate_id=d.id AND x.department_id=dep.id AND x.job_title_id=j.id)""",
+             AND (EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles x WHERE x.directorate_id=d.id AND x.department_id=dep.id AND x.job_title_id=j.id)
+                  OR EXISTS (SELECT 1 FROM public.employees e WHERE e.work_center=c.name AND e.directorate=d.name AND e.department=dep.name AND e.job_title=j.name AND e.employment_status='على رأس عمله'))""",
         (directorate_id,department_id,job_title_id,work_center_id),
     ).fetchone()
     if not path:
