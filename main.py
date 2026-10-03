@@ -316,6 +316,26 @@ def employee_options(work_center: str = "", directorate: str = "", department: s
                 params,
             ).fetchall()
             result[key] = sorted((str(row["value"]) for row in rows), key=str.casefold)
+        title_where=["c.name IS NOT NULL","btrim(c.name)<>''"]
+        title_params=[]
+        if directorate:
+            title_where.append("(d.name=%s OR EXISTS (SELECT 1 FROM public.workforce_requirements p WHERE p.directorate_id=d.id AND p.source_directorate=%s))")
+            title_params.extend([directorate,directorate])
+        if department:
+            title_where.append("(dep.name=%s OR EXISTS (SELECT 1 FROM public.workforce_requirements p WHERE p.department_id=dep.id AND p.source_department=%s))")
+            title_params.extend([department,department])
+        title_sql=" WHERE "+" AND ".join(title_where)
+        rows=conn.execute(
+            f"""SELECT DISTINCT c.name AS value
+               FROM public.planning_job_title_catalog c
+               LEFT JOIN public.ref_job_titles j ON LOWER(BTRIM(j.name))=LOWER(BTRIM(c.name))
+               LEFT JOIN public.ref_directorate_department_job_titles jt ON jt.job_title_id=j.id
+               LEFT JOIN public.ref_directorates d ON d.id=jt.directorate_id
+               LEFT JOIN public.ref_departments dep ON dep.id=jt.department_id
+               {title_sql} ORDER BY value""",
+            title_params,
+        ).fetchall()
+        result["job_title"]=sorted((str(row["value"]) for row in rows),key=str.casefold)
     return result
 
 
@@ -693,6 +713,20 @@ async def import_employees(request: Request, file: UploadFile = File(...)):
         raise
     except Exception:
         raise HTTPException(status_code=422, detail="تعذر قراءة ملف Excel. تأكد أنه ملف .xlsx سليم.")
+    try:
+        with connect() as conn:
+            planned_rows=conn.execute("SELECT name FROM public.planning_job_title_catalog ORDER BY name").fetchall()
+            planned_titles={normalize_reference_label(row["name"]):row["name"] for row in planned_rows}
+            if planned_titles:
+                unmapped=sorted({row[5] for row in rows if normalize_reference_label(row[5]) not in planned_titles})
+                if unmapped:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"message":"يوجد مسميات في ملف الموظفين غير موجودة في ملفات التخطيط. وحّد المسميات قبل الاستيراد.","job_titles":unmapped[:30]},
+                    )
+                rows=[row[:5]+(planned_titles[normalize_reference_label(row[5])],)+row[6:] for row in rows]
+    except HTTPException:
+        raise
     file_hash = hashlib.sha256(content).hexdigest()
     try:
         with connect() as conn:
@@ -794,6 +828,12 @@ def reference_data():
                JOIN public.ref_departments p ON p.id=x.department_id
                JOIN public.ref_job_titles j ON j.id=x.job_title_id
                ORDER BY d.name,p.name,j.name"""
+        ).fetchall()
+        data["planning_job_titles"] = conn.execute(
+            """SELECT DISTINCT j.id,j.name
+               FROM public.planning_job_title_catalog c
+               JOIN public.ref_job_titles j ON LOWER(BTRIM(j.name))=LOWER(BTRIM(c.name))
+               ORDER BY j.name"""
         ).fetchall()
     return data
 
@@ -1073,7 +1113,7 @@ def _planning_match(refs, category: str, value: Any, prefix: bool = False):
     return None
 
 
-def _planning_source_rows(workbook, service_line: str, source_filename: str, refs):
+def _planning_source_rows(workbook, service_line: str, source_filename: str, refs, include_zero: bool = False):
     if service_line == "hospitals":
         ws = next((workbook[name] for name in workbook.sheetnames if normalize_reference_label(name) == "مستشفيات"), None)
         if ws is None:
@@ -1138,7 +1178,7 @@ def _planning_source_rows(workbook, service_line: str, source_filename: str, ref
                 required = int(float(raw_required or 0))
             except (TypeError, ValueError, OverflowError):
                 continue
-            if required <= 0:
+            if required < 0 or (required == 0 and not include_zero):
                 continue
             source_dir = str(values[0] or "").strip()
             source_dept = str(values[1] or "").strip()
@@ -1222,9 +1262,8 @@ def list_workforce_requirements(service_line: str = "", location_name: str = "",
                                    WHERE cd.center_id=p.work_center_id AND cd.directorate_id=p.directorate_id)
                        AND EXISTS (SELECT 1 FROM public.ref_directorate_departments dd
                                    WHERE dd.directorate_id=p.directorate_id AND dd.department_id=p.department_id)
-                       AND (EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles jt
+                       AND EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles jt
                                    WHERE jt.directorate_id=p.directorate_id AND jt.department_id=p.department_id AND jt.job_title_id=p.job_title_id)
-                       OR EXISTS (SELECT 1 FROM public.employees e WHERE e.work_center=c.name AND e.directorate=d.name AND e.department=dep.name AND e.job_title=j.name AND e.employment_status='على رأس عمله'))
                       ) AS mapping_complete
                FROM public.workforce_requirements p
                LEFT JOIN public.ref_work_centers c ON c.id=p.work_center_id
@@ -1262,8 +1301,7 @@ def _validate_requirement_payload(conn, payload):
            WHERE c.id=%s
              AND EXISTS (SELECT 1 FROM public.ref_center_directorates x WHERE x.center_id=c.id AND x.directorate_id=d.id)
              AND EXISTS (SELECT 1 FROM public.ref_directorate_departments x WHERE x.directorate_id=d.id AND x.department_id=dep.id)
-             AND (EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles x WHERE x.directorate_id=d.id AND x.department_id=dep.id AND x.job_title_id=j.id)
-                  OR EXISTS (SELECT 1 FROM public.employees e WHERE e.work_center=c.name AND e.directorate=d.name AND e.department=dep.name AND e.job_title=j.name AND e.employment_status='على رأس عمله'))""",
+             AND EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles x WHERE x.directorate_id=d.id AND x.department_id=dep.id AND x.job_title_id=j.id)""",
         (directorate_id,department_id,job_title_id,work_center_id),
     ).fetchone()
     if not path:
@@ -1355,12 +1393,68 @@ async def import_workforce_plans(request: Request, hospitals_file: UploadFile = 
     except Exception:
         raise HTTPException(status_code=422,detail="تعذر قراءة ملفي Excel. تحقق من صحة الملفين.")
     with connect() as conn:
+        planning_titles=set()
+        for workbook in (hospital_wb,primary_wb):
+            for ws in workbook.worksheets:
+                for values in ws.iter_rows(min_row=5,values_only=True):
+                    if len(values)<3 or not isinstance(values[2],str):
+                        continue
+                    title=clean_text(values[2])
+                    if title and "مجموع" not in normalize_reference_label(title):
+                        planning_titles.add(title)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS public.planning_job_title_catalog(
+                   name TEXT PRIMARY KEY,
+                   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+               )"""
+        )
+        planning_titles={title for title in planning_titles if normalize_reference_label(title) not in {"المسمى الوظيفي","المسمى","الوظيفة","اسم الوظيفة"}}
+        title_rows=conn.execute("SELECT id,name FROM public.ref_job_titles ORDER BY name").fetchall()
+        known={normalize_reference_label(row["name"]):row for row in title_rows}
+        canonical_by_key={}
+        for title in sorted(planning_titles):
+            key=normalize_reference_label(title)
+            if not key or key in canonical_by_key:
+                continue
+            if key in known:
+                current=known[key]
+                if current["name"]!=title:
+                    conn.execute("UPDATE public.ref_job_titles SET name=%s WHERE id=%s",(title,current["id"]))
+                    known[key]={"id":current["id"],"name":title}
+            else:
+                known[key]=conn.execute(
+                    "INSERT INTO public.ref_job_titles(name) VALUES (%s) RETURNING id,name",(title,)
+                ).fetchone()
+            canonical_by_key[key]=title
+        canonical_plan_titles=sorted(canonical_by_key.values())
+        conn.execute("DELETE FROM public.planning_job_title_catalog")
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO public.planning_job_title_catalog(name) VALUES (%s)",
+                [(title,) for title in canonical_plan_titles],
+            )
         refs=_planning_ref_maps(conn)
+        catalog_records=[]
+        catalog_records+=_planning_source_rows(hospital_wb,"hospitals",uploads[0][0],refs,include_zero=True)
+        catalog_records+=_planning_source_rows(hospital_wb,"emergency",uploads[0][0],refs,include_zero=True)
+        catalog_records+=_planning_source_rows(primary_wb,"primary_care",uploads[1][0],refs,include_zero=True)
         records=_planning_source_rows(hospital_wb,"hospitals",uploads[0][0],refs)
         records+=_planning_source_rows(hospital_wb,"emergency",uploads[0][0],refs)
         records+=_planning_source_rows(primary_wb,"primary_care",uploads[1][0],refs)
         if not records:
             raise HTTPException(status_code=422,detail="لم أعثر على قيم احتياج أكبر من صفر في الملفين.")
+        for record in catalog_records:
+            if not all((record["directorate_id"],record["department_id"],record["job_title_id"])):
+                continue
+            conn.execute(
+                """INSERT INTO public.ref_directorate_department_job_titles(directorate_id,department_id,job_title_id)
+                   SELECT %s,%s,%s
+                   WHERE EXISTS (SELECT 1 FROM public.ref_directorate_departments dd
+                                 WHERE dd.directorate_id=%s AND dd.department_id=%s)
+                   ON CONFLICT DO NOTHING""",
+                (record["directorate_id"],record["department_id"],record["job_title_id"],
+                 record["directorate_id"],record["department_id"]),
+            )
         with conn.cursor() as cur:
             cur.executemany(
                 """INSERT INTO public.workforce_requirements(
@@ -1374,6 +1468,19 @@ async def import_workforce_plans(request: Request, hospitals_file: UploadFile = 
                 [(r["service_line"],r["location_name"],r["work_center_id"],r["directorate_id"],r["department_id"],r["job_title_id"],
                   r["source_directorate"],r["source_department"],r["source_job_title"],r["required_count"],r["source_file"]) for r in records],
             )
+        canonical_titles={normalize_reference_label(r["source_job_title"]):r["source_job_title"] for r in conn.execute(
+            "SELECT name AS source_job_title FROM public.planning_job_title_catalog"
+        ).fetchall()}
+        employee_titles=conn.execute("SELECT employee_number,job_title FROM public.employees WHERE job_title IS NOT NULL").fetchall()
+        title_updates=[
+            (canonical_titles[normalize_reference_label(row["job_title"])],row["employee_number"])
+            for row in employee_titles
+            if normalize_reference_label(row["job_title"]) in canonical_titles
+            and row["job_title"]!=canonical_titles[normalize_reference_label(row["job_title"])]
+        ]
+        if title_updates:
+            with conn.cursor() as cur:
+                cur.executemany("UPDATE public.employees SET job_title=%s WHERE employee_number=%s",title_updates)
     return {
         "imported_rows":len(records),
         "unmapped_titles":len({r["source_job_title"] for r in records if not r["job_title_id"]}),
