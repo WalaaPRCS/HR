@@ -1437,6 +1437,8 @@ def list_projects():
         row["total_budget"] = sum(int(p["planned_count"] or 0) * float(p["budget_amount"] or 0) for p in row["positions"])
         for pos in row["positions"]:
             pos["budget_amount"] = float(pos["budget_amount"] or 0)
+            pos["current_count"] = int(pos["current_count"] or 0)
+            pos["shortage"] = max(0, int(pos["planned_count"] or 0) - pos["current_count"])
     return {"items": projects, "total": len(projects)}
 
 
