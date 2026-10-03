@@ -67,7 +67,7 @@ function refSelect(key,label,options,current,required=true){
 }
 function filteredDirectorates(refs,center){const ids=(refs.center_directorates||[]).filter(r=>r.left_name===center).map(r=>String(r.right_id));return(refs.directorates||[]).filter(x=>ids.includes(String(x.id)))}
 function filteredDepartments(refs,directorate){const ids=(refs.directorate_departments||[]).filter(r=>r.left_name===directorate).map(r=>String(r.right_id));return(refs.departments||[]).filter(x=>ids.includes(String(x.id)))}
-function filteredTitles(refs,directorate,department){const path=(refs.directorate_department_paths||[]).find(p=>p.directorate_name===directorate&&p.department_name===department);return path?(refs.department_job_titles||[]).filter(t=>String(t.path_id)===String(path.path_id)).map(t=>({id:t.right_id,name:t.right_name})):[]}
+function filteredTitles(refs,directorate,department){const path=(refs.directorate_department_paths||[]).find(p=>p.directorate_name===directorate&&p.department_name===department);const planned=new Set((refs.planning_job_titles||[]).map(t=>String(t.id)));return path?(refs.department_job_titles||[]).filter(t=>String(t.path_id)===String(path.path_id)&&planned.has(String(t.right_id))).map(t=>({id:t.right_id,name:t.right_name})):[]}
 function renderEditForm(x,refs){
  const basics='<h3 class="edit-section-title">البيانات الأساسية</h3>'+editField("employee_number","رقم الموظف",x.employee_number)+editField("employee_name","اسم الموظف",x.employee_name)+editField("employee_code","كود الموظف",x.employee_code);
  const directors=filteredDirectorates(refs,x.work_center),departments=filteredDepartments(refs,x.directorate),titles=filteredTitles(refs,x.directorate,x.department);
