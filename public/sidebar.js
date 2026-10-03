@@ -17,9 +17,10 @@
     {icon:"⇧", label:"استيراد الموظفين"},
     {icon:"▤", label:"القدرة والموظفون"}
   ];
-  const path = location.pathname.replace(/\\/+$/, "") || "/";
+  const normalize = value => value.length > 1 && value.endsWith("/") ? value.slice(0, -1) : value;
+  const path = normalize(location.pathname) || "/";
   const linkMarkup = links.map(item => {
-    const target = item.href.replace(/\\/+$/, "") || "/";
+    const target = normalize(item.href) || "/";
     const active = path === target;
     return '<a href="' + item.href + '" class="app-nav-link' + (active ? ' active' : '') + '"' + (active ? ' aria-current="page"' : '') + '><span class="app-icon" aria-hidden="true">' + item.icon + '</span><span>' + item.label + '</span></a>';
   }).join("");
