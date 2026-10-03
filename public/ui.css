@@ -1,0 +1,27 @@
+/* Shared typography, filters and form controls for PRCS HR */
+:root{--ui-red:#c8102e;--ui-ink:#243041;--ui-muted:#778494;--ui-line:#e2e8ee;--ui-soft:#f6f8fa;--ui-focus:#c8102e1c}
+html,body{font-family:"IBM Plex Sans Arabic",Tahoma,sans-serif!important;color:var(--ui-ink)}
+button,input,select,textarea,option{font-family:"IBM Plex Sans Arabic",Tahoma,sans-serif!important;letter-spacing:0}
+button{font-weight:600}
+h1,h2,h3,h4{font-family:"IBM Plex Sans Arabic",Tahoma,sans-serif!important;color:var(--ui-ink);letter-spacing:0;line-height:1.45}
+h1{font-weight:700}
+h2,h3,h4{font-weight:650}
+table,th,td{font-family:"IBM Plex Sans Arabic",Tahoma,sans-serif}
+.filter-grid,.filters2,.filters,.toolbar{gap:11px!important;align-items:end}
+.filter-grid .field label,.filters2 .field label{font-size:12px!important;font-weight:600;color:#536173;margin-bottom:6px}
+.filter-grid .field label:before,.filters2 .field label:before{color:var(--ui-red)!important;font-size:17px!important}
+.filter-grid .field input,.filters2 .field input,.filters>input,.filters>select,.toolbar>input,.toolbar>select,.search-filter-input,.filter{height:42px!important;min-height:42px;border:1px solid var(--ui-line)!important;border-radius:10px!important;background:#fff!important;color:var(--ui-ink)!important;padding:8px 11px!important;font-size:13px!important;line-height:1.5!important;box-shadow:0 1px 2px #17223508;transition:border-color .15s,box-shadow .15s}
+.filter-grid .field input,.filters2 .field input,.filters>input,.toolbar>input{width:100%}
+.filter-grid .field input:focus,.filters2 .field input:focus,.filters>input:focus,.filters>select:focus,.toolbar>input:focus,.toolbar>select:focus,.search-filter-input:focus,.filter:focus{outline:none!important;border-color:#d77889!important;box-shadow:0 0 0 3px var(--ui-focus)!important}
+.filter-grid input::placeholder,.filters2 input::placeholder,.filters input::placeholder,.toolbar input::placeholder,.search-filter-input::placeholder{color:#8a95a3;opacity:1}
+.filters>button,.toolbar>button,#reset,#clearFilters{min-height:42px;border-radius:10px;font-family:inherit;font-size:13px}
+.filters .search-filter{flex:1 1 170px;min-width:165px}
+.toolbar .search-filter{flex:1 1 155px;min-width:150px}
+.search-filter-input{padding-right:34px!important}
+.search-filter:before{top:8px!important}
+.search-filter-menu{border-color:var(--ui-line)!important;border-radius:10px!important}
+.search-filter-option{font-family:inherit!important;font-size:13px!important}
+.search-filter-option:hover,.search-filter-option:focus{background:#fff0f2!important;color:var(--ui-red)!important}
+.panel-head,.section-title,.page-title{font-family:inherit}
+@media(max-width:1050px){.filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.filter-grid .field:first-child{grid-column:1/-1}.filters2{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:700px){.filter-grid,.filters2{grid-template-columns:1fr!important}.filter-grid .field:first-child{grid-column:auto}.filters{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))}.filters .search-filter,.filters>input{min-width:0!important;grid-column:span 2}.filters2{margin-top:10px}.toolbar{align-items:stretch}.toolbar .search-filter,.toolbar>input,.toolbar>select{flex:1 1 100%;min-width:0!important}}
