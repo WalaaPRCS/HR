@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -1033,5 +1034,359 @@ def delete_reference_link(relation: str,left_id: int,right_id: int,request: Requ
         )
     return {"ok":True}
 
+
+
+def normalize_reference_label(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().lower().replace("ـ", "")
+    text = "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
+    text = text.translate(str.maketrans({"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ة":"ه","ؤ":"و","ئ":"ي"}))
+    return re.sub(r"\\s+", " ", text).strip()
+
+
+def _planning_ref_maps(conn):
+    tables = {
+        "work_centers":"ref_work_centers",
+        "directorates":"ref_directorates",
+        "departments":"ref_departments",
+        "job_titles":"ref_job_titles",
+    }
+    return {
+        key: {normalize_reference_label(row["name"]): row for row in conn.execute(
+            f"SELECT id,name FROM public.{table} ORDER BY name"
+        ).fetchall()}
+        for key, table in tables.items()
+    }
+
+
+def _planning_match(refs, category: str, value: Any, prefix: bool = False):
+    key = normalize_reference_label(value)
+    pool = refs.get(category, {})
+    if key in pool:
+        return pool[key]
+    if prefix and key:
+        for normalized, row in pool.items():
+            if normalized.startswith(key + " ") or key.startswith(normalized + " "):
+                return row
+    return None
+
+
+def _planning_source_rows(workbook, service_line: str, source_filename: str, refs):
+    if service_line == "hospitals":
+        ws = next((workbook[name] for name in workbook.sheetnames if normalize_reference_label(name) == "مستشفيات"), None)
+        if ws is None:
+            raise HTTPException(status_code=422, detail="ملف المستشفيات لا يحتوي على ورقة «مستشفيات».")
+        blocks = []
+        for col in range(4, min(ws.max_column, 22) + 1, 3):
+            loc = ws.cell(3, col).value
+            if loc and "مستشفى" in str(loc) and "مجموع" not in str(loc):
+                center = _planning_match(refs, "work_centers", loc, prefix=True)
+                blocks.append((col, str(loc).strip(), center, None, None))
+    elif service_line == "primary_care":
+        ws = next((workbook[name] for name in workbook.sheetnames if "رعاية" in normalize_reference_label(name)), None)
+        if ws is None:
+            raise HTTPException(status_code=422, detail="ملف الرعاية الأولية لا يحتوي على ورقة الرعاية.")
+        center = _planning_match(refs, "work_centers", "الرعاية الصحية الأولية")
+        directorate = _planning_match(refs, "directorates", "العيادات والخدمات العلاجية")
+        blocks = []
+        for col in range(4, ws.max_column + 1, 3):
+            loc = ws.cell(3, col).value
+            if not loc or "مجموع" in str(loc):
+                continue
+            location = re.sub(r"\\s*[-–]\\s*مستوى رابع\\s*", "", str(loc)).strip()
+            department = _planning_match(refs, "departments", location)
+            blocks.append((col, location, center, directorate, department))
+    else:
+        ws = next((workbook[name] for name in workbook.sheetnames if "اسعاف" in normalize_reference_label(name)), None)
+        if ws is None:
+            raise HTTPException(status_code=422, detail="ملف المستشفيات لا يحتوي على ورقة دائرة الإسعاف والطوارئ.")
+        center = _planning_match(refs, "work_centers", "الاسعاف والطواري -غزة", prefix=True)
+        dir_alias = {
+            "إدارة الدائرة":"ادارة الاسعاف", "خدمة المعبر":"ادارة الاسعاف",
+            "مركز الشمال":"مركز جباليا", "مركز غزة":"مركز غزة",
+            "مركز دير البلح":"مركز دير البلح", "مركز خانيونس":"مركز خان يونس",
+            "مركز رفح":"مركز رفح",
+        }
+        dept_alias = {
+            "إدارة الدائرة":"ادارة الاسعاف", "خدمة المعبر":"",
+            "مركز الشمال":"اسعاف جباليا", "مركز غزة":"اسعاف غزة",
+            "مركز دير البلح":"اسعاف دير البلح", "مركز خانيونس":"اسعاف خان يونس",
+            "مركز رفح":"اسعاف رفح",
+        }
+        blocks = []
+        for col in range(4, ws.max_column + 1, 3):
+            loc = ws.cell(3, col).value
+            if not loc or "مجموع" in str(loc):
+                continue
+            location = str(loc).strip()
+            directorate = _planning_match(refs, "directorates", dir_alias.get(location, ""))
+            department = _planning_match(refs, "departments", dept_alias.get(location, ""))
+            blocks.append((col, location, center, directorate, department))
+
+    records = []
+    for col, location, center, mapped_dir, mapped_dept in blocks:
+        for values in ws.iter_rows(min_row=5, values_only=True):
+            if len(values) < 3 or not isinstance(values[2], str):
+                continue
+            source_title = values[2].strip()
+            if not source_title or "مجموع" in source_title:
+                continue
+            raw_required = values[col - 1] if len(values) >= col else None
+            try:
+                required = int(float(raw_required or 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if required <= 0:
+                continue
+            source_dir = str(values[0] or "").strip()
+            source_dept = str(values[1] or "").strip()
+            if service_line == "hospitals":
+                directorate = _planning_match(refs, "directorates", source_dir)
+                department = _planning_match(refs, "departments", source_dept)
+                if not department and source_dept.startswith("أقسام "):
+                    department = _planning_match(refs, "departments", "قسم " + source_dept[len("أقسام "):])
+            elif service_line == "primary_care":
+                directorate = mapped_dir
+                department = mapped_dept
+            else:
+                directorate = mapped_dir
+                department = mapped_dept
+            job = _planning_match(refs, "job_titles", source_title)
+            aliases = {
+                "طبيب نساء وتوليد":"طبيب نساء وولادة",
+                "أخصائي العلاج الطبيعي":"أخصائي علاج طبيعي",
+            }
+            if not job and source_title in aliases:
+                job = _planning_match(refs, "job_titles", aliases[source_title])
+            records.append({
+                "service_line": service_line,
+                "location_name": location,
+                "work_center_id": center["id"] if center else None,
+                "directorate_id": directorate["id"] if directorate else None,
+                "department_id": department["id"] if department else None,
+                "job_title_id": job["id"] if job else None,
+                "source_directorate": source_dir,
+                "source_department": source_dept,
+                "source_job_title": source_title,
+                "required_count": required,
+                "source_file": source_filename,
+            })
+    return records
+
+
+@app.get("/api/planning")
+def list_workforce_requirements(service_line: str = "", location_name: str = "", q: str = ""):
+    where = []
+    params = []
+    if service_line in {"hospitals", "primary_care", "emergency"}:
+        where.append("p.service_line=%s"); params.append(service_line)
+    if location_name.strip():
+        where.append("p.location_name=%s"); params.append(location_name.strip())
+    if q.strip():
+        where.append("(p.source_directorate ILIKE %s OR p.source_department ILIKE %s OR p.source_job_title ILIKE %s OR p.location_name ILIKE %s OR coalesce(j.name,'') ILIKE %s)")
+        term = f"%{q.strip()}%"; params.extend([term,term,term,term,term])
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    with connect() as conn:
+        rows = conn.execute(
+            f"""WITH actual_staff AS (
+                   SELECT work_center,directorate,department,job_title,
+                          count(*) AS available,
+                          jsonb_agg(jsonb_build_object(
+                              'employee_number',employee_number,
+                              'employee_name',employee_name,
+                              'is_frozen',is_frozen
+                          ) ORDER BY employee_name) AS employees
+                   FROM public.employees
+                   WHERE employment_status='على رأس عمله'
+                   GROUP BY work_center,directorate,department,job_title
+               )
+               SELECT p.id,p.service_line,p.location_name,p.source_directorate,p.source_department,
+                      p.source_job_title,p.required_count,p.source_file,p.updated_at,
+                      p.work_center_id,c.name AS work_center,
+                      p.directorate_id,d.name AS directorate,
+                      p.department_id,dep.name AS department,
+                      p.job_title_id,j.name AS mapped_job_title,
+                      coalesce(s.available,0) AS available,
+                      coalesce(s.employees,'[]'::jsonb) AS employees,
+                      (p.work_center_id IS NOT NULL AND p.directorate_id IS NOT NULL
+                       AND p.department_id IS NOT NULL AND p.job_title_id IS NOT NULL
+                       AND EXISTS (SELECT 1 FROM public.ref_center_directorates cd
+                                   WHERE cd.center_id=p.work_center_id AND cd.directorate_id=p.directorate_id)
+                       AND EXISTS (SELECT 1 FROM public.ref_directorate_departments dd
+                                   WHERE dd.directorate_id=p.directorate_id AND dd.department_id=p.department_id)
+                       AND EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles jt
+                                   WHERE jt.directorate_id=p.directorate_id AND jt.department_id=p.department_id AND jt.job_title_id=p.job_title_id)
+                      ) AS mapping_complete
+               FROM public.workforce_requirements p
+               LEFT JOIN public.ref_work_centers c ON c.id=p.work_center_id
+               LEFT JOIN public.ref_directorates d ON d.id=p.directorate_id
+               LEFT JOIN public.ref_departments dep ON dep.id=p.department_id
+               LEFT JOIN public.ref_job_titles j ON j.id=p.job_title_id
+               LEFT JOIN actual_staff s ON s.work_center=c.name AND s.directorate=d.name
+                       AND s.department=dep.name AND s.job_title=j.name
+               {where_sql}
+               ORDER BY p.service_line,p.location_name,p.source_directorate,p.source_department,p.source_job_title""",
+            params,
+        ).fetchall()
+    for row in rows:
+        row["shortage"] = int(row["required_count"]) - int(row["available"])
+    return {"items": rows, "total": len(rows)}
+
+
+def _validate_requirement_payload(conn, payload):
+    try:
+        work_center_id = int(payload.get("work_center_id"))
+        directorate_id = int(payload.get("directorate_id"))
+        department_id = int(payload.get("department_id"))
+        job_title_id = int(payload.get("job_title_id"))
+        required = int(payload.get("required_count"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="أكمل مركز العمل والإدارة والقسم والمسمى والاحتياج.")
+    if required < 0:
+        raise HTTPException(status_code=422, detail="الاحتياج لا يمكن أن يكون أقل من صفر.")
+    path = conn.execute(
+        """SELECT c.name AS center,d.name AS directorate,dep.name AS department,j.name AS job_title
+           FROM public.ref_work_centers c
+           JOIN public.ref_directorates d ON d.id=%s
+           JOIN public.ref_departments dep ON dep.id=%s
+           JOIN public.ref_job_titles j ON j.id=%s
+           WHERE c.id=%s
+             AND EXISTS (SELECT 1 FROM public.ref_center_directorates x WHERE x.center_id=c.id AND x.directorate_id=d.id)
+             AND EXISTS (SELECT 1 FROM public.ref_directorate_departments x WHERE x.directorate_id=d.id AND x.department_id=dep.id)
+             AND EXISTS (SELECT 1 FROM public.ref_directorate_department_job_titles x WHERE x.directorate_id=d.id AND x.department_id=dep.id AND x.job_title_id=j.id)""",
+        (directorate_id,department_id,job_title_id,work_center_id),
+    ).fetchone()
+    if not path:
+        raise HTTPException(status_code=422, detail="المسمى أو القسم غير مرتبط بالمسار التنظيمي المختار في الإعدادات.")
+    return work_center_id,directorate_id,department_id,job_title_id,required,path
+
+
+@app.post("/api/planning")
+async def create_workforce_requirement(request: Request):
+    check_same_origin(request)
+    payload = await request.json()
+    if not isinstance(payload,dict):
+        raise HTTPException(status_code=400,detail="بيانات الاحتياج غير صالحة.")
+    service_line = payload.get("service_line")
+    if service_line not in {"hospitals","primary_care","emergency"}:
+        raise HTTPException(status_code=422,detail="اختر نوع التخطيط.")
+    location = clean_text(payload.get("location_name"))
+    if not location:
+        raise HTTPException(status_code=422,detail="أدخل اسم المنشأة أو الموقع.")
+    with connect() as conn:
+        center_id,directorate_id,department_id,job_id,required,path = _validate_requirement_payload(conn,payload)
+        try:
+            row=conn.execute(
+                """INSERT INTO public.workforce_requirements(
+                       service_line,location_name,work_center_id,directorate_id,department_id,job_title_id,
+                       source_directorate,source_department,source_job_title,required_count,source_file
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'إدخال يدوي')
+                   RETURNING id""",
+                (service_line,location,center_id,directorate_id,department_id,job_id,
+                 path["directorate"],path["department"],path["job_title"],required),
+            ).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(status_code=409,detail="يوجد احتياج مسجل بالمسار نفسه لهذا الموقع.")
+    return {"id":row["id"],"ok":True}
+
+
+@app.patch("/api/planning/{item_id}")
+async def update_workforce_requirement(item_id: int, request: Request):
+    check_same_origin(request)
+    payload = await request.json()
+    if not isinstance(payload,dict):
+        raise HTTPException(status_code=400,detail="بيانات الاحتياج غير صالحة.")
+    location=clean_text(payload.get("location_name"))
+    if not location:
+        raise HTTPException(status_code=422,detail="أدخل اسم المنشأة أو الموقع.")
+    with connect() as conn:
+        current=conn.execute("SELECT id FROM public.workforce_requirements WHERE id=%s FOR UPDATE",(item_id,)).fetchone()
+        if not current: raise HTTPException(status_code=404,detail="سجل الاحتياج غير موجود.")
+        center_id,directorate_id,department_id,job_id,required,path = _validate_requirement_payload(conn,payload)
+        try:
+            conn.execute(
+                """UPDATE public.workforce_requirements
+                   SET location_name=%s,work_center_id=%s,directorate_id=%s,department_id=%s,
+                       job_title_id=%s,required_count=%s,updated_at=NOW()
+                   WHERE id=%s""",
+                (location,center_id,directorate_id,department_id,job_id,required,item_id),
+            )
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(status_code=409,detail="يوجد احتياج آخر بالمسار نفسه لهذا الموقع.")
+    return {"ok":True}
+
+
+@app.delete("/api/planning/{item_id}")
+def delete_workforce_requirement(item_id: int, request: Request):
+    check_same_origin(request)
+    with connect() as conn:
+        cur=conn.execute("DELETE FROM public.workforce_requirements WHERE id=%s RETURNING id",(item_id,))
+        if not cur.fetchone(): raise HTTPException(status_code=404,detail="سجل الاحتياج غير موجود.")
+    return {"ok":True}
+
+
+@app.post("/api/planning/import")
+async def import_workforce_plans(request: Request, hospitals_file: UploadFile = File(...), primary_care_file: UploadFile = File(...)):
+    check_same_origin(request)
+    uploads=[]
+    for upload in (hospitals_file,primary_care_file):
+        if not upload.filename or not upload.filename.lower().endswith(".xlsx"):
+            raise HTTPException(status_code=415,detail="ارفع ملفين بصيغة Excel .xlsx.")
+        contents=await upload.read()
+        if len(contents)>MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413,detail="حجم أحد الملفات أكبر من الحد المسموح.")
+        uploads.append((upload.filename,contents))
+    try:
+        hospital_wb=load_workbook(io.BytesIO(uploads[0][1]),data_only=True,read_only=True)
+        primary_wb=load_workbook(io.BytesIO(uploads[1][1]),data_only=True,read_only=True)
+    except Exception:
+        raise HTTPException(status_code=422,detail="تعذر قراءة ملفي Excel. تحقق من صحة الملفين.")
+    with connect() as conn:
+        refs=_planning_ref_maps(conn)
+        records=_planning_source_rows(hospital_wb,"hospitals",uploads[0][0],refs)
+        records+=_planning_source_rows(hospital_wb,"emergency",uploads[0][0],refs)
+        records+=_planning_source_rows(primary_wb,"primary_care",uploads[1][0],refs)
+        if not records:
+            raise HTTPException(status_code=422,detail="لم أعثر على قيم احتياج أكبر من صفر في الملفين.")
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO public.workforce_requirements(
+                       service_line,location_name,work_center_id,directorate_id,department_id,job_title_id,
+                       source_directorate,source_department,source_job_title,required_count,source_file
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(service_line,location_name,source_directorate,source_department,source_job_title)
+                   DO UPDATE SET work_center_id=EXCLUDED.work_center_id,directorate_id=EXCLUDED.directorate_id,
+                       department_id=EXCLUDED.department_id,job_title_id=EXCLUDED.job_title_id,
+                       required_count=EXCLUDED.required_count,source_file=EXCLUDED.source_file,updated_at=NOW()""",
+                [(r["service_line"],r["location_name"],r["work_center_id"],r["directorate_id"],r["department_id"],r["job_title_id"],
+                  r["source_directorate"],r["source_department"],r["source_job_title"],r["required_count"],r["source_file"]) for r in records],
+            )
+    return {
+        "imported_rows":len(records),
+        "unmapped_titles":len({r["source_job_title"] for r in records if not r["job_title_id"]}),
+        "unmapped_paths":sum(1 for r in records if not all([r["work_center_id"],r["directorate_id"],r["department_id"],r["job_title_id"]])),
+    }
+
+
+@app.get("/api/organization/structure")
+def organization_structure(work_center: str = "", directorate: str = "", department: str = "", job_title: str = "", employment_status: str = "على رأس عمله"):
+    conditions=[];params=[]
+    for column,value in (("work_center",work_center),("directorate",directorate),("department",department),("job_title",job_title),("employment_status",employment_status)):
+        if value.strip():
+            conditions.append(f"{column}=%s");params.append(value.strip())
+    where=("WHERE "+" AND ".join(conditions)) if conditions else ""
+    with connect() as conn:
+        rows=conn.execute(
+            f"""SELECT work_center,directorate,department,job_title,count(*) AS employee_count,
+                       jsonb_agg(jsonb_build_object('employee_number',employee_number,'employee_name',employee_name,
+                           'cadre_type',cadre_type,'employment_status',employment_status,'is_frozen',is_frozen)
+                           ORDER BY employee_name) AS employees
+                FROM public.employees {where}
+                GROUP BY work_center,directorate,department,job_title
+                ORDER BY work_center,directorate,department,job_title""",
+            params,
+        ).fetchall()
+    return {"items":rows,"total":len(rows)}
 
 app.mount("/", StaticFiles(directory=PUBLIC_DIR, html=True), name="public")
