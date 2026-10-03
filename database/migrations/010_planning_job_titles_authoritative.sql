@@ -1,11 +1,22 @@
--- Job titles in the workforce-planning workbooks are the canonical choices for employees.
-INSERT INTO public.ref_job_titles (name)
+-- The planning workbook is the authoritative source for employee job titles.
+CREATE TABLE IF NOT EXISTS public.planning_job_title_catalog (
+  name TEXT PRIMARY KEY,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO public.planning_job_title_catalog(name)
 SELECT DISTINCT BTRIM(p.source_job_title)
 FROM public.workforce_requirements p
 WHERE NULLIF(BTRIM(p.source_job_title), '') IS NOT NULL
+ON CONFLICT(name) DO NOTHING;
+
+INSERT INTO public.ref_job_titles (name)
+SELECT DISTINCT BTRIM(c.name)
+FROM public.planning_job_title_catalog c
+WHERE NULLIF(BTRIM(c.name), '') IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM public.ref_job_titles jt
-      WHERE LOWER(BTRIM(jt.name)) = LOWER(BTRIM(p.source_job_title))
+      WHERE LOWER(BTRIM(jt.name)) = LOWER(BTRIM(c.name))
   );
 
 UPDATE public.workforce_requirements p
