@@ -1434,7 +1434,7 @@ def list_projects():
         row["assigned_count"] = len(row["employees"])
         row["position_count"] = len(row["positions"])
         row["total_planned"] = sum(int(p["planned_count"]) for p in row["positions"])
-        row["total_budget"] = sum(float(p["budget_amount"] or 0) for p in row["positions"])
+        row["total_budget"] = sum(int(p["planned_count"] or 0) * float(p["budget_amount"] or 0) for p in row["positions"])
         for pos in row["positions"]:
             pos["budget_amount"] = float(pos["budget_amount"] or 0)
     return {"items": projects, "total": len(projects)}
