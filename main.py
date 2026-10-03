@@ -1084,7 +1084,7 @@ def _planning_source_rows(workbook, service_line: str, source_filename: str, ref
                 center = _planning_match(refs, "work_centers", loc, prefix=True)
                 blocks.append((col, str(loc).strip(), center, None, None))
     elif service_line == "primary_care":
-        ws = next((workbook[name] for name in workbook.sheetnames if "رعاية" in normalize_reference_label(name)), None)
+        ws = next((workbook[name] for name in workbook.sheetnames if "رعايه" in normalize_reference_label(name)), None)
         if ws is None:
             raise HTTPException(status_code=422, detail="ملف الرعاية الأولية لا يحتوي على ورقة الرعاية.")
         center = _planning_match(refs, "work_centers", "الرعاية الصحية الأولية")
