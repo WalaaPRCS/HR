@@ -774,6 +774,7 @@ def reference_data():
                JOIN public.ref_departments p ON p.id=x.department_id
                ORDER BY d.name,p.name"""
         ).fetchall()
+        data["projects"] = conn.execute("SELECT id,name FROM public.projects ORDER BY name").fetchall()
         data["directorate_department_paths"] = conn.execute(
             """SELECT x.directorate_id,x.department_id,
                       x.directorate_id::text || ':' || x.department_id::text AS path_id,
@@ -1376,6 +1377,267 @@ async def import_workforce_plans(request: Request, hospitals_file: UploadFile = 
         "unmapped_titles":len({r["source_job_title"] for r in records if not r["job_title_id"]}),
         "unmapped_paths":sum(1 for r in records if not all([r["work_center_id"],r["directorate_id"],r["department_id"],r["job_title_id"]])),
     }
+
+
+
+def _project_position_title_id(conn, title_label: str):
+    normalized = normalize_reference_label(title_label)
+    rows = conn.execute("SELECT id,name FROM public.ref_job_titles ORDER BY name").fetchall()
+    for row in rows:
+        if normalize_reference_label(row["name"]) == normalized:
+            return row["id"], row["name"]
+    return None, title_label
+
+
+@app.get("/api/projects")
+def list_projects():
+    with connect() as conn:
+        projects = conn.execute(
+            "SELECT id,name,description,start_date,end_date,created_at,updated_at FROM public.projects ORDER BY name"
+        ).fetchall()
+        positions = conn.execute(
+            """SELECT pp.id,pp.project_id,pp.job_title_id,pp.title_label,pp.planned_count,
+                      pp.budget_amount,j.name AS mapped_title
+               FROM public.project_positions pp
+               LEFT JOIN public.ref_job_titles j ON j.id=pp.job_title_id
+               ORDER BY pp.project_id,pp.title_label"""
+        ).fetchall()
+        staff = conn.execute(
+            """SELECT employee_number,employee_name,project,job_title,work_center,directorate,
+                      department,cadre_type,employment_status,is_frozen
+               FROM public.employees
+               WHERE NULLIF(BTRIM(project),'') IS NOT NULL
+               ORDER BY project,job_title,employee_name"""
+        ).fetchall()
+    position_map = {}
+    for pos in positions:
+        pos["employees"] = []
+        pos["current_count"] = 0
+        pos["title"] = pos["mapped_title"] or pos["title_label"]
+        position_map.setdefault(pos["project_id"], []).append(pos)
+    project_by_name = {row["name"]: row for row in projects}
+    for row in projects:
+        row["positions"] = position_map.get(row["id"], [])
+        row["employees"] = []
+    for emp in staff:
+        project = project_by_name.get(emp["project"])
+        if not project:
+            continue
+        project["employees"].append(emp)
+        title = normalize_reference_label(emp["job_title"])
+        for pos in project["positions"]:
+            if normalize_reference_label(pos["title"]) == title:
+                pos["employees"].append(emp)
+                pos["current_count"] += 1
+                break
+    for row in projects:
+        row["assigned_count"] = len(row["employees"])
+        row["position_count"] = len(row["positions"])
+        row["total_planned"] = sum(int(p["planned_count"]) for p in row["positions"])
+        row["total_budget"] = sum(float(p["budget_amount"] or 0) for p in row["positions"])
+        for pos in row["positions"]:
+            pos["budget_amount"] = float(pos["budget_amount"] or 0)
+    return {"items": projects, "total": len(projects)}
+
+
+@app.post("/api/projects/discover")
+async def discover_projects_from_employee_roster(request: Request, file: UploadFile = File(...)):
+    check_same_origin(request)
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=415, detail="ارفع كشف الموظفين بصيغة Excel .xlsx.")
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="حجم الملف أكبر من الحد المسموح.")
+    try:
+        workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail="تعذر قراءة ملف Excel. تحقق من صحة الملف.")
+    sheet = None
+    header = None
+    required_headers = {
+        "رقم الموظف": normalize_reference_label("رقم الموظف"),
+        "المشروع": normalize_reference_label("المشروع"),
+        "المسمى الوظيفي": normalize_reference_label("المسمى الوظيفي"),
+    }
+    for ws in workbook.worksheets:
+        for row_index, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 12), values_only=True), start=1):
+            normalized = {normalize_reference_label(value): idx for idx, value in enumerate(row) if value is not None}
+            if all(value in normalized for value in required_headers.values()):
+                sheet, header = ws, normalized
+                break
+        if sheet:
+            break
+    if not sheet or not header:
+        raise HTTPException(status_code=422, detail="لم أجد أعمدة رقم الموظف والمشروع والمسمى الوظيفي في الملف.")
+    project_col = header[required_headers["المشروع"]]
+    title_col = header[required_headers["المسمى الوظيفي"]]
+    number_col = header[required_headers["رقم الموظف"]]
+    records = []
+    counts = {}
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        if len(row) <= max(project_col, title_col, number_col):
+            continue
+        raw_number, raw_project, raw_title = row[number_col], row[project_col], row[title_col]
+        project_name = clean_text(raw_project)
+        if not project_name:
+            continue
+        employee_number = clean_text(raw_number)
+        if isinstance(raw_number, float) and raw_number.is_integer():
+            employee_number = str(int(raw_number))
+        title_label = clean_text(raw_title) or "مسمى غير محدد"
+        records.append((employee_number, project_name, title_label))
+        counts[(project_name, title_label)] = counts.get((project_name, title_label), 0) + 1
+    if not records:
+        raise HTTPException(status_code=422, detail="لم أعثر على موظفين مرتبطين بمشاريع في الكشف.")
+    with connect() as conn:
+        refs = _planning_ref_maps(conn)
+        project_names = sorted({project for _, project, _ in records})
+        for name in project_names:
+            conn.execute(
+                "INSERT INTO public.projects(name) VALUES (%s) ON CONFLICT(name) DO NOTHING",
+                (name,),
+            )
+        for (project_name, title_label), assigned_count in counts.items():
+            title = _planning_match(refs, "job_titles", title_label)
+            conn.execute(
+                """INSERT INTO public.project_positions(project_id,job_title_id,title_label,planned_count,budget_amount)
+                   SELECT id,%s,%s,%s,0 FROM public.projects WHERE name=%s
+                   ON CONFLICT(project_id,title_label) DO NOTHING""",
+                (title["id"] if title else None, title_label, assigned_count, project_name),
+            )
+        employee_ids = [number for number, _, _ in records if number]
+        matched = 0
+        if employee_ids:
+            existing = conn.execute(
+                "SELECT employee_number FROM public.employees WHERE employee_number = ANY(%s)",
+                (employee_ids,),
+            ).fetchall()
+            existing_ids = {str(row["employee_number"]) for row in existing}
+            assignments = [(project, number) for number, project, _ in records if number and number in existing_ids]
+            if assignments:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        "UPDATE public.employees SET project=%s WHERE employee_number=%s",
+                        assignments,
+                    )
+            matched = len(assignments)
+    return {
+        "projects_found": len(project_names),
+        "positions_found": len(counts),
+        "employees_matched": matched,
+        "employees_not_found": len([1 for number, _, _ in records if number]) - matched,
+    }
+
+
+def _save_project_positions(conn, project_id: int, positions):
+    if not isinstance(positions, list) or len(positions) > 200:
+        raise HTTPException(status_code=422, detail="قائمة المسميات الوظيفية غير صالحة.")
+    clean_positions = []
+    seen = set()
+    for item in positions:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=422, detail="أحد صفوف الوظائف غير صالح.")
+        try:
+            planned_count = int(item.get("planned_count", 0))
+            budget_amount = Decimal(str(item.get("budget_amount", 0) or 0))
+        except (ValueError, TypeError, InvalidOperation):
+            raise HTTPException(status_code=422, detail="تأكد من صحة العدد والموازنة لكل مسمى.")
+        if planned_count < 0 or budget_amount < 0:
+            raise HTTPException(status_code=422, detail="العدد والموازنة لا يمكن أن يكونا سالبين.")
+        raw_title_id = item.get("job_title_id")
+        if raw_title_id:
+            try:
+                title_id = int(raw_title_id)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=422, detail="المسمى الوظيفي المختار غير صالح.")
+            title = conn.execute("SELECT id,name FROM public.ref_job_titles WHERE id=%s", (title_id,)).fetchone()
+            if not title:
+                raise HTTPException(status_code=422, detail="المسمى الوظيفي غير موجود في الإعدادات.")
+            title_label = title["name"]
+        else:
+            title_id = None
+            title_label = clean_text(item.get("title_label"))
+            if not title_label:
+                raise HTTPException(status_code=422, detail="اختر المسمى الوظيفي لكل صف.")
+        key = normalize_reference_label(title_label)
+        if key in seen:
+            raise HTTPException(status_code=422, detail="لا تكرر المسمى الوظيفي داخل المشروع.")
+        seen.add(key)
+        clean_positions.append((project_id, title_id, title_label, planned_count, budget_amount))
+    conn.execute("DELETE FROM public.project_positions WHERE project_id=%s", (project_id,))
+    if clean_positions:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO public.project_positions(project_id,job_title_id,title_label,planned_count,budget_amount)
+                   VALUES (%s,%s,%s,%s,%s)""",
+                clean_positions,
+            )
+
+
+@app.post("/api/projects")
+async def create_project(request: Request):
+    check_same_origin(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="بيانات المشروع غير صالحة.")
+    name = clean_text(payload.get("name"))
+    if not name:
+        raise HTTPException(status_code=422, detail="أدخل اسم المشروع.")
+    description = clean_text(payload.get("description"))
+    with connect() as conn:
+        try:
+            row = conn.execute(
+                """INSERT INTO public.projects(name,description,start_date,end_date)
+                   VALUES (%s,%s,NULLIF(%s,'')::date,NULLIF(%s,'')::date) RETURNING id""",
+                (name, description, payload.get("start_date") or "", payload.get("end_date") or ""),
+            ).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(status_code=409, detail="اسم المشروع مسجل مسبقاً.")
+        _save_project_positions(conn, row["id"], payload.get("positions", []))
+    return {"ok": True, "id": row["id"]}
+
+
+@app.put("/api/projects/{project_id}")
+async def update_project(project_id: int, request: Request):
+    check_same_origin(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="بيانات المشروع غير صالحة.")
+    name = clean_text(payload.get("name"))
+    if not name:
+        raise HTTPException(status_code=422, detail="أدخل اسم المشروع.")
+    description = clean_text(payload.get("description"))
+    with connect() as conn:
+        current = conn.execute("SELECT id,name FROM public.projects WHERE id=%s FOR UPDATE", (project_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+        try:
+            conn.execute(
+                """UPDATE public.projects SET name=%s,description=%s,start_date=NULLIF(%s,'')::date,
+                       end_date=NULLIF(%s,'')::date,updated_at=NOW() WHERE id=%s""",
+                (name, description, payload.get("start_date") or "", payload.get("end_date") or "", project_id),
+            )
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(status_code=409, detail="اسم المشروع مسجل مسبقاً.")
+        if current["name"] != name:
+            conn.execute("UPDATE public.employees SET project=%s WHERE project=%s", (name, current["name"]))
+        _save_project_positions(conn, project_id, payload.get("positions", []))
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int, request: Request):
+    check_same_origin(request)
+    with connect() as conn:
+        current = conn.execute("SELECT id,name FROM public.projects WHERE id=%s", (project_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+        linked = conn.execute("SELECT count(*) AS n FROM public.employees WHERE project=%s", (current["name"],)).fetchone()["n"]
+        if linked:
+            raise HTTPException(status_code=409, detail=f"لا يمكن حذف المشروع قبل نقل أو إزالة {linked} موظفاً مرتبطاً به.")
+        conn.execute("DELETE FROM public.projects WHERE id=%s", (project_id,))
+    return {"ok": True}
+
 
 
 @app.get("/api/organization/structure")
