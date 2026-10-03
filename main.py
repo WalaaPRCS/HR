@@ -1195,6 +1195,12 @@ def list_workforce_requirements(service_line: str = "", location_name: str = "",
                           jsonb_agg(jsonb_build_object(
                               'employee_number',employee_number,
                               'employee_name',employee_name,
+                              'work_center',work_center,
+                              'directorate',directorate,
+                              'department',department,
+                              'job_title',job_title,
+                              'cadre_type',cadre_type,
+                              'employment_status',employment_status,
                               'is_frozen',is_frozen
                           ) ORDER BY employee_name) AS employees
                    FROM public.employees
